@@ -45,6 +45,9 @@ stockPanel/
 | Python   | >= 3.10     | 后端运行               |
 | npm      | >= 9        | 随 Node.js 安装        |
 
+`./start.sh` 启动前会校验上述依赖与 Python 版本，缺失时直接给出中文提示而不是运行中途报错。
+脚本为 bash 脚本（激活 `.venv/bin/activate`），Windows 需用 WSL 或 Git Bash。
+
 ## 一、后端启动
 
 ### 1. 创建虚拟环境并安装依赖
@@ -179,6 +182,8 @@ cp .env.example .env
 | --- | --- | --- |
 | `STOCKPANEL_DATA_DIR` | macOS: `~/Library/Application Support/StockPanel` | 数据存储目录 |
 | `STOCKPANEL_PORT` | `18900` | 后端服务端口 |
+| `STOCKPANEL_FRONTEND_PORT` | `5173` | Vite 开发端口（仅开发模式；被占用时 Vite 自动顺延） |
+| `STOCKPANEL_BACKEND_URL` | 跟随 `STOCKPANEL_PORT` | 开发模式 `/api` 代理目标（由 `start.sh` 注入，一般不用手设） |
 | `STOCK_DATA_MODE` | `mock` | 数据源模式（见上表） |
 | `DATAHUBCO_API_KEY` | 空 | Datahubco 基础版密钥（仅本地配置） |
 | `DATAHUBCO_ALLOW_HTTP` | `false` | 基础版为明文 HTTP，必须显式置 `true` 才启用 |
