@@ -1,0 +1,35 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Node / Electron
+frontend/node_modules/
+frontend/out/
+frontend/dist/
+
+# 运行时生成
+backend/cache/
+logs/
+
+# 系统
+.DS_Store
+
+# 本地密钥与私有配置（不提交）
+backend/.env
+.env
+*.local
+
+# 本地密钥文件与数据库兜底（正常位于系统应用数据目录，防止误放仓库）
+secret.key
+*.db
+
+# Agent 工具运行时状态（会话记录、私有元数据）
+.omc/
+**/.omc/
+
+# 第三方参考代码（go-stock，GPL-3.0，仅本地参考）
+references/
+
+# 测试缓存
+.pytest_cache/

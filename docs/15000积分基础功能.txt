@@ -1,0 +1,2293 @@
+# Datahubco 客户 API 调用手册
+
+> 目标：客户按统一格式一次调用成功，避免因接口名、日期、代码、分页或字段写法错误而失败。
+> 版本：2026-08-27；接口参数以 Tushare 官方文档和上游返回为最终准则。
+
+## 1. 先记住这 8 条
+
+1. 当前客户入口是 `GET /app-api/openapi/v1/tushare/{api}`；接口名使用清单中的小写下划线写法。
+2. 客户密钥只放在请求头 `X-API-Key`，不要放在 URL、日志或代码仓库里。
+3. `fields` 是返回列选择，不是业务筛选参数；多个字段用英文逗号分隔。
+4. 日期统一使用 `YYYYMMDD`，财报期通常使用季度末 `YYYYMMDD`；电视剧备案使用 `YYYYMM`，神奇九转可能使用时间戳。
+5. `start_date` 和 `end_date` 必须成对；不要同时发送 `trade_date` 与区间参数。
+6. `limit`、`offset` 只能是非负整数；使用 `offset` 时必须同时给 `limit`。建议每页不超过 5,000 行。
+7. `code=0` 且 `items=[]` 表示查询成功但没有匹配数据，不是服务器故障。
+8. 本网关不增加客户侧限流；但 Tushare 上游的积分、权限和频率规则仍然生效。
+
+## 2. 地址与鉴权
+
+当前公开域名为 `datahubco.com`，示例中的 `BASE_URL` 请替换为实际入口：
+
+```text
+BASE_URL=http://datahubco.com
+API_KEY=你的客户密钥
+```
+
+当前服务器仍以 HTTP 80 提供服务，HTTPS 尚未配置。生产环境不要在不可信网络中明文传输密钥；待证书上线后，把 `BASE_URL` 改为 `https://datahubco.com`。
+
+### cURL 通用模板
+
+```bash
+curl --get "${BASE_URL}/app-api/openapi/v1/tushare/daily" \
+  -H "X-API-Key: ${API_KEY}" \
+  -H "X-Request-Id: client-demo-0001" \
+  --data-urlencode "ts_code=000001.SZ" \
+  --data-urlencode "trade_date=20260825" \
+  --data-urlencode "fields=ts_code,trade_date,open,close"
+```
+
+### Python requests 通用模板
+
+```python
+import requests
+
+url = "http://datahubco.com/app-api/openapi/v1/tushare/daily"
+headers = {"X-API-Key": "YOUR_CUSTOMER_KEY", "X-Request-Id": "client-demo-0001"}
+params = {"ts_code": "000001.SZ", "trade_date": "20260825", "fields": "ts_code,trade_date,open,close"}
+response = requests.get(url, headers=headers, params=params, timeout=30)
+response.raise_for_status()
+payload = response.json()
+if payload.get("code") != 0:
+    raise RuntimeError(payload.get("msg", "unknown API error"))
+rows = payload["data"]["items"]
+```
+
+### 返回格式
+
+```json
+{
+  "code": 0,
+  "msg": "",
+  "data": {
+    "fields": ["ts_code", "trade_date", "close"],
+    "items": [["000001.SZ", "20260825", 12.34]]
+  }
+}
+```
+
+`items` 是按 `fields` 顺序排列的数组；不要按固定列号猜字段，先读取 `data.fields` 再映射。
+
+## 3. 参数规则速查
+
+| 参数 | 写法 | 常见用途 | 易错点 |
+|---|---|---|---|
+| `ts_code` | `000001.SZ`、`600000.SH`、`00001.HK` | 股票/指数/基金/债券/合约代码 | 后缀必须正确；多个代码仅在官方说明支持时用逗号分隔 |
+| `trade_date` | `20260825` | 单日行情或单日统计 | 不是 `2026-08-25` |
+| `start_date` + `end_date` | `20250101` / `20251231` | 时间区间 | 两个必须同时出现，且开始不晚于结束 |
+| `period` | `20251231` | 财报期/季度 | 不能写 `2025Q4` |
+| `date` | `20260825` | 利率、票房等非交易表 | 电视剧接口使用 `YYYYMM` |
+| `fields` | `ts_code,trade_date,close` | 选返回列 | 不要重复、不要写 `trade-date`；未知字段会被上游拒绝 |
+| `limit` / `offset` | `100` / `0` | 分页 | 只能是非负整数；`offset` 必须配 `limit` |
+
+### 缓存与本地数据提示
+
+- 返回头 `X-Data-Source: sqlite`、`X-Cache: LOCAL` 表示本地 SQLite；`X-Data-Source: redis`、`X-Cache: HIT` 表示 Redis 热命中；`upstream/MISS` 表示回源。
+- 参数顺序不会影响缓存键，但 `fields` 的字段顺序会影响键；客户应固定字段顺序。
+- 实时/分钟类接口不要期待历史缓存；本地数据只对已证明完整的请求形状生效。
+
+## 4. 80 个接口总览
+
+| API | 中文名称 | 分类 | 调用选择条件 | 当前路径 |
+|---|---|---|---|---|
+| `daily` | 日线行情 | 股票 | 按说明选择 | 本地 + Redis |
+| `weekly` | 周线行情 | 股票 | 按说明选择 | 上游/缓存 |
+| `monthly` | 月线行情 | 股票 | 按说明选择 | 上游/缓存 |
+| `pro_bar` | 复权行情 | 股票 | ts_code、asset、freq | HTTP 不支持 |
+| `daily_basic` | 每日指标 | 股票 | ts_code | 本地 + Redis |
+| `new_share` | IPO新股列表 | 股票 | 按说明选择 | 上游/缓存 |
+| `top_list` | 龙虎榜每日明细 | 股票 | trade_date | 上游/缓存 |
+| `top_inst` | 龙虎榜机构明细 | 股票 | trade_date | 上游/缓存 |
+| `pledge_detail` | 股权质押明细 | 股票 | 按说明选择 | 上游/缓存 |
+| `pledge_stat` | 股权质押统计 | 股票 | 按说明选择 | 上游/缓存 |
+| `margin` | 融资融券交易汇总 | 股票 | 按说明选择 | 上游/缓存 |
+| `margin_detail` | 融资融券交易明细 | 股票 | 按说明选择 | 上游/缓存 |
+| `repurchase` | 股票回购 | 股票 | 按说明选择 | 上游/缓存 |
+| `share_float` | 限售股解禁 | 股票 | 按说明选择 | 上游/缓存 |
+| `block_trade` | 大宗交易 | 股票 | 按说明选择 | 上游/缓存 |
+| `stk_holdernumber` | 股东人数 | 股票 | 按说明选择 | 上游/缓存 |
+| `moneyflow` | 个股资金流向 | 股票 | 按说明选择 | 上游/缓存 |
+| `stk_holdertrade` | 股东增减持 | 股票 | 按说明选择 | 上游/缓存 |
+| `stk_limit` | 每日涨跌停价格 | 股票 | 按说明选择 | 上游/缓存 |
+| `hk_hold` | 沪深股通持股明细 | 股票 | 按说明选择 | 上游/缓存 |
+| `income` | 利润表 | 财务 | ts_code | 上游/缓存 |
+| `balancesheet` | 资产负债表 | 财务 | ts_code | 上游/缓存 |
+| `cashflow` | 现金流量表 | 财务 | ts_code | 上游/缓存 |
+| `forecast` | 业绩预告 | 财务 | 按说明选择 | 上游/缓存 |
+| `express` | 业绩快报 | 财务 | ts_code | 上游/缓存 |
+| `dividend` | 分红送股 | 财务 | 按说明选择 | 上游/缓存 |
+| `fina_indicator` | 财务指标数据 | 财务 | ts_code | 上游/缓存 |
+| `fina_audit` | 财务审计意见 | 财务 | ts_code | 上游/缓存 |
+| `fina_mainbz` | 主营业务构成 | 财务 | ts_code | 上游/缓存 |
+| `disclosure_date` | 财报披露计划 | 财务 | 按说明选择 | 上游/缓存 |
+| `fund_basic` | 公募基金列表 | 基金 | 按说明选择 | 上游/缓存 |
+| `fund_company` | 公募基金公司 | 基金 | 按说明选择 | 上游/缓存 |
+| `fund_nav` | 公募基金净值 | 基金 | 按说明选择 | 上游/缓存 |
+| `fund_daily` | 场内基金日线行情 | 基金 | 按说明选择 | 本地 + Redis |
+| `fund_div` | 公募基金分红 | 基金 | 按说明选择 | 上游/缓存 |
+| `fund_portfolio` | 公募基金持仓 | 基金 | 按说明选择 | 上游/缓存 |
+| `fund_adj` | 基金复权因子 | 基金 | 按说明选择 | 上游/缓存 |
+| `fut_basic` | 期货合约列表 | 期货 | exchange | 上游/缓存 |
+| `trade_cal` | 期货交易日历 | 期货 | 按说明选择 | 本地 + Redis |
+| `fut_daily` | 期货日线行情 | 期货 | 按说明选择 | 上游/缓存 |
+| `fut_holding` | 每日成交持仓排名 | 期货 | 按说明选择 | 上游/缓存 |
+| `fut_wsr` | 仓单日报 | 期货 | 按说明选择 | 上游/缓存 |
+| `fut_settle` | 结算参数 | 期货 | 按说明选择 | 上游/缓存 |
+| `index_daily` | 指数日线行情（清单另列“南华期货指数行情”） | 指数 | ts_code | 本地 + Redis |
+| `opt_basic` | 期权合约列表 | 期权 | 按说明选择 | 上游/缓存 |
+| `opt_daily` | 期权日线行情 | 期权 | 按说明选择 | 上游/缓存 |
+| `cb_basic` | 可转债基础信息 | 债券 | 按说明选择 | 上游/缓存 |
+| `cb_issue` | 可转债发行数据 | 债券 | 按说明选择 | 上游/缓存 |
+| `cb_daily` | 可转债日线数据 | 债券 | 按说明选择 | 本地 + Redis |
+| `fx_obasic` | 外汇基础信息 | 外汇 | 按说明选择 | 上游/缓存 |
+| `fx_daily` | 外汇日线行情 | 外汇 | 按说明选择 | 上游/缓存 |
+| `index_basic` | 指数基本信息 | 指数 | 按说明选择 | 上游/缓存 |
+| `index_weekly` | 指数周线行情 | 指数 | 按说明选择 | 上游/缓存 |
+| `index_monthly` | 指数月线行情 | 指数 | 按说明选择 | 上游/缓存 |
+| `index_weight` | 指数成分和权重 | 指数 | index_code | 上游/缓存 |
+| `index_dailybasic` | 大盘指数每日指标 | 指数 | 按说明选择 | 本地 + Redis |
+| `index_classify` | 申万行业分类 | 指数 | 按说明选择 | 上游/缓存 |
+| `index_member_all` | 申万行业成分 | 指数 | 按说明选择 | 上游/缓存 |
+| `hk_basic` | 港股列表 | 港股 | 按说明选择 | 上游/缓存 |
+| `shibor` | SHIBOR利率数据 | 宏观 | 按说明选择 | 上游/缓存 |
+| `shibor_quote` | SHIBOR报价数据 | 宏观 | 按说明选择 | 上游/缓存 |
+| `shibor_lpr` | LPR贷款基础利率 | 宏观 | 按说明选择 | 上游/缓存 |
+| `libor` | LIBOR拆借利率 | 宏观 | 按说明选择 | 上游/缓存 |
+| `hibor` | HIBOR拆借利率 | 宏观 | 按说明选择 | 上游/缓存 |
+| `wz_index` | 温州民间借贷利率 | 宏观 | 按说明选择 | 上游/缓存 |
+| `gz_index` | 广州民间借贷利率 | 宏观 | 按说明选择 | 上游/缓存 |
+| `tmt_twincome` | 台湾电子产业月营收 | 行业特色 | item | 上游/缓存 |
+| `tmt_twincomedetail` | 台湾电子产业月营收明细 | 行业特色 | 按说明选择 | 上游/缓存 |
+| `bo_monthly` | 电影月度票房 | 行业特色 | date | 上游/缓存 |
+| `bo_weekly` | 电影周度票房 | 行业特色 | date | 上游/缓存 |
+| `bo_daily` | 电影日度票房 | 行业特色 | date | 上游/缓存 |
+| `bo_cinema` | 影院每日票房 | 行业特色 | date | 上游/缓存 |
+| `film_record` | 全国电影剧本备案 | 行业特色 | 按说明选择 | 上游/缓存 |
+| `teleplay_record` | 全国电视剧本备案 | 行业特色 | 按说明选择 | 上游/缓存 |
+| `report_rc` | 券商(卖方)盈利预测 | 特色 | 按说明选择 | 上游/缓存 |
+| `cyq_perf` | 每日筹码成本和胜率 | 特色 | ts_code | 上游/缓存 |
+| `cyq_chips` | 每日筹码分布 | 特色 | ts_code | 上游/缓存 |
+| `stk_rewards` | 券商金股 | 特色 | ts_code | 上游/缓存 |
+| `stk_factor_pro` | 技术面因子 | 特色 | 按说明选择 | 上游/缓存 |
+| `stk_nineturn` | 神奇九转(TD序列) | 特色 | 按说明选择 | 上游/缓存 |
+
+## 5. 逐接口调用说明
+
+### 股票
+
+#### 1. `daily` - 日线行情
+
+**用途**：全部历史，交易日15-17点更新。
+**积分提示**：清单标注最低积分 `120起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=27
+**调用选择**：可用单日或区间查询：`trade_date`；或 `start_date`+`end_date`。区间查询建议同时给 `ts_code`；不要把 `trade_date` 与区间参数混用。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/daily?ts_code=000001.SZ&trade_date=20260825&fields=ts_code,trade_date,open,high,low,close`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码（支持多个股票同时提取，逗号分隔） |
+| `trade_date` | `str` | 否 | 交易日期（YYYYMMDD） |
+| `start_date` | `str` | 否 | 开始日期(YYYYMMDD) |
+| `end_date` | `str` | 否 | 结束日期(YYYYMMDD) |
+
+**常用返回字段**：`ts_code`, `trade_date`, `open`, `high`, `low`, `close`。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+#### 2. `weekly` - 周线行情
+
+**用途**：全部历史，每周五更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=144
+**调用选择**：`ts_code` 与 `trade_date` 二选一；区间查询使用成对的 `start_date`、`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/weekly?ts_code=000001.SZ&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 （ts_code,trade_date两个参数任选一） |
+| `trade_date` | `str` | 否 | 交易日期 （每周最后一个交易日期，YYYYMMDD格式） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `open`, `high`, `low`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 3. `monthly` - 月线行情
+
+**用途**：全部历史，每月更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=145
+**调用选择**：`ts_code` 与 `trade_date` 二选一；区间查询使用成对的 `start_date`、`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/monthly?ts_code=000001.SZ&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 （ts_code,trade_date两个参数任选一） |
+| `trade_date` | `str` | 否 | 交易日期 （每月最后一个交易日日期，YYYYMMDD格式） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `open`, `high`, `low`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 4. `pro_bar` - 复权行情
+
+**用途**：分钟/指数/基金/期货除外。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=146
+**调用选择**：官方接口要求 `ts_code`、`asset`、`freq`；但官方说明 HTTP 方式不能调取，本网关不要调用。
+
+**推荐请求**：
+
+`本网关不提供该接口的 HTTP 调用；不要复制下面的 URL 到客户程序。`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 证券代码 |
+| `start_date` | `str` | 否 | 开始日期 (格式：YYYYMMDD) |
+| `end_date` | `str` | 否 | 结束日期 (格式：YYYYMMDD) |
+| `asset` | `str` | 是 | 资产类别：E股票 I沪深指数 FT期货 FD基金 O期权，默认E |
+| `adj` | `str` | 否 | 复权类型(只针对股票)：None未复权 qfq前复权 hfq后复权 , 默认None |
+| `freq` | `str` | 是 | 数据频度 ：1MIN表示1分钟（1/5/15/30/60分钟） D日线 ，默认D |
+| `ma` | `list` | 否 | 均线，支持任意周期的均价和均量，输入任意合理int数值 |
+
+**常用返回字段**：以响应中的 `data.fields` 为准；建议先不传 `fields`。。
+**特别注意**：官方文档明确说明该接口通过 SDK 动态计算复权，HTTP 方式无法调取。本客户网关是 HTTP GET；请改用 `stk_factor_pro`（静态技术因子）或直接使用官方 Python SDK。
+**本服务器行为**：不支持通过本 HTTP 网关调用；请使用官方 SDK 或改用可通过 HTTP 的静态接口。
+
+官方 SDK 形态（直连 Tushare，不经过本客户网关）：
+
+```python
+pro.pro_bar(ts_code="000001.SZ", start_date="20250101", end_date="20251231", asset="E", freq="D", adj="qfq")
+```
+
+---
+
+#### 5. `daily_basic` - 每日指标
+
+**用途**：PE/PB/市值/换手等。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=32
+**调用选择**：`ts_code` 或 `trade_date` 至少提供一个；按单股票区间查询时同时给 `ts_code`、`start_date`、`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/daily_basic?ts_code=000001.SZ&trade_date=20260825&fields=ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码（二选一） |
+| `trade_date` | `str` | 否 | 交易日期 （二选一） |
+| `start_date` | `str` | 否 | 开始日期(YYYYMMDD) |
+| `end_date` | `str` | 否 | 结束日期(YYYYMMDD) |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `turnover_rate`, `turnover_rate_f`, `volume_ratio`。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+#### 6. `new_share` - IPO新股列表
+
+**用途**：每日19点更新。
+**积分提示**：清单标注最低积分 `120`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=123
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/new_share?start_date=20260101&end_date=20261231&fields=ts_code,sub_code,name,ipo_date,issue_date,amount`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `start_date` | `str` | 否 | 上网发行开始日期 |
+| `end_date` | `str` | 否 | 上网发行结束日期 |
+
+**常用返回字段**：`ts_code`, `sub_code`, `name`, `ipo_date`, `issue_date`, `amount`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 7. `top_list` - 龙虎榜每日明细
+
+**用途**：2005年起，每日晚8点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=106
+**调用选择**：`trade_date` 必填；`ts_code` 可选。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/top_list?trade_date=20260825&fields=trade_date,ts_code,name,close,pct_change,turnover_rate`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 是 | 交易日期 |
+| `ts_code` | `str` | 否 | 股票代码 |
+
+**常用返回字段**：`trade_date`, `ts_code`, `name`, `close`, `pct_change`, `turnover_rate`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 8. `top_inst` - 龙虎榜机构明细
+
+**用途**：2005年起，每日晚8点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=107
+**调用选择**：`trade_date` 必填；`ts_code` 可选。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/top_inst?trade_date=20260825&fields=trade_date,ts_code,exalter,side,buy,buy_rate`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 是 | 交易日期 |
+| `ts_code` | `str` | 否 | TS代码 |
+
+**常用返回字段**：`trade_date`, `ts_code`, `exalter`, `side`, `buy`, `buy_rate`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 9. `pledge_detail` - 股权质押明细
+
+**用途**：2004年起，每日晚9点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=111
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/pledge_detail?ts_code=000001.SZ&fields=ts_code,ann_date,holder_name,pledge_amount,start_date,end_date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `holder_name`, `pledge_amount`, `start_date`, `end_date`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 10. `pledge_stat` - 股权质押统计
+
+**用途**：2014年起，每日晚9点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=110
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/pledge_stat?ts_code=000001.SZ&end_date=20251231&fields=ts_code,end_date,pledge_count,unrest_pledge,rest_pledge,total_share`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 |
+| `end_date` | `str` | 否 | 截止日期 |
+
+**常用返回字段**：`ts_code`, `end_date`, `pledge_count`, `unrest_pledge`, `rest_pledge`, `total_share`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 11. `margin` - 融资融券交易汇总
+
+**用途**：2010年起，每日9点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=58
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/margin?trade_date=20260825&fields=trade_date,exchange_id,rzye,rzmre,rzche,rqye`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期（格式：YYYYMMDD，下同） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+| `exchange_id` | `str` | 否 | 交易所代码（SSE上交所SZSE深交所BSE北交所） |
+
+**常用返回字段**：`trade_date`, `exchange_id`, `rzye`, `rzmre`, `rzche`, `rqye`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 12. `margin_detail` - 融资融券交易明细
+
+**用途**：2010年起，每日9点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=59
+**调用选择**：可按 `trade_date` 或 `ts_code` 查询；区间使用 `start_date`+`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/margin_detail?trade_date=20260825&ts_code=000001.SZ&fields=trade_date,ts_code,name,rzye,rqye,rzmre`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期（格式：YYYYMMDD，下同） |
+| `ts_code` | `str` | 否 | TS代码 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`trade_date`, `ts_code`, `name`, `rzye`, `rqye`, `rzmre`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 13. `repurchase` - 股票回购
+
+**用途**：2011年起，每日定时。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=124
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/repurchase?start_date=20250101&end_date=20251231&fields=ts_code,ann_date,end_date,proc,exp_date,vol`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ann_date` | `str` | 否 | 公告日期（任意填参数，如果都不填，单次默认返回2000条） |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `proc`, `exp_date`, `vol`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 14. `share_float` - 限售股解禁
+
+**用途**：定期更新。
+**积分提示**：清单标注最低积分 `3000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=160
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/share_float?ts_code=000001.SZ&start_date=20250101&end_date=20251231&fields=ts_code,ann_date,float_date,float_share,float_ratio,holder_name`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS股票代码 |
+| `ann_date` | `str` | 否 | 公告日期（日期格式：YYYYMMDD，下同） |
+| `float_date` | `str` | 否 | 解禁日期 |
+| `start_date` | `str` | 否 | 解禁开始日期 |
+| `end_date` | `str` | 否 | 解禁结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `float_date`, `float_share`, `float_ratio`, `holder_name`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 15. `block_trade` - 大宗交易
+
+**用途**：每日晚9点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=161
+**调用选择**：请按参数描述提供至少一个业务筛选条件；区间查询的开始和结束日期必须成对出现。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/block_trade?trade_date=20260825&fields=ts_code,trade_date,price,vol,amount,buyer`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码（股票代码和日期至少输入一个参数） |
+| `trade_date` | `str` | 否 | 交易日期（格式：YYYYMMDD，下同） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `price`, `vol`, `amount`, `buyer`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 16. `stk_holdernumber` - 股东人数
+
+**用途**：不定期更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=166
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_holdernumber?ts_code=000001.SZ&enddate=20251231&fields=ts_code,ann_date,end_date,holder_num`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS股票代码 |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `enddate` | `str` | 否 | 截止日期 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `holder_num`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 17. `moneyflow` - 个股资金流向
+
+**用途**：交易日19点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=170
+**调用选择**：股票代码或时间条件至少提供一个；区间必须同时提供 `start_date`、`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/moneyflow?ts_code=000001.SZ&start_date=20260101&end_date=20260825&fields=ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,sell_sm_amount`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 （股票和时间参数至少输入一个） |
+| `trade_date` | `str` | 否 | 交易日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `buy_sm_vol`, `buy_sm_amount`, `sell_sm_vol`, `sell_sm_amount`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 18. `stk_holdertrade` - 股东增减持
+
+**用途**：交易日19点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=175
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_holdertrade?ts_code=000001.SZ&start_date=20250101&end_date=20251231&fields=ts_code,ann_date,holder_name,holder_type,in_de,change_vol`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS股票代码 |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+| `trade_type` | `str` | 否 | 交易类型IN增持DE减持 |
+| `holder_type` | `str` | 否 | 股东类型C公司P个人G高管 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `holder_name`, `holder_type`, `in_de`, `change_vol`。
+**特别注意**：`trade_type` 使用 `IN`（增持）或 `DE`（减持）；`holder_type` 使用 `C`、`P` 或 `G`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 19. `stk_limit` - 每日涨跌停价格
+
+**用途**：交易日9点。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=183
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_limit?trade_date=20260825&fields=trade_date,ts_code,pre_close,up_limit,down_limit`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 |
+| `trade_date` | `str` | 否 | 交易日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`trade_date`, `ts_code`, `pre_close`, `up_limit`, `down_limit`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 20. `hk_hold` - 沪深股通持股明细
+
+**用途**：下个交易日8点。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=188 (legacy page currently unavailable)
+**调用选择**：这是清单中的历史接口，官方旧文档已下线；参数和权限需先向上游验证，不能据此承诺可用。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/hk_hold?ts_code=600000.SH&start_date=20250101&end_date=20251231`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码；历史接口，建议与日期条件一起使用 |
+| `trade_date` | `str` | 否 | 交易日期，YYYYMMDD |
+| `start_date` | `str` | 否 | 开始日期，YYYYMMDD |
+| `end_date` | `str` | 否 | 结束日期，YYYYMMDD |
+| `exchange` | `str` | 否 | 市场/交易所筛选；取值以上游当前文档为准 |
+
+**常用返回字段**：以响应中的 `data.fields` 为准；建议先不传 `fields`。。
+**特别注意**：清单保留了该历史接口，但当前官方文档页已返回 404，服务器也没有本地快照。调用前请先确认 Tushare 当前接口名、参数和账号权限。
+**本服务器行为**：历史接口，当前无本地快照；默认回源，但需先确认上游接口和权限。
+
+---
+
+### 财务
+
+#### 21. `income` - 利润表
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=33
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/income?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,f_ann_date,end_date,report_type,comp_type`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期（YYYYMMDD格式，下同） |
+| `f_ann_date` | `str` | 否 | 实际公告日期 |
+| `start_date` | `str` | 否 | 公告日开始日期 |
+| `end_date` | `str` | 否 | 公告日结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期，比如20171231表示年报，20170630半年报，20170930三季报) |
+| `report_type` | `str` | 否 | 报告类型，参考文档最下方说明 |
+| `comp_type` | `str` | 否 | 公司类型（1一般工商业2银行3保险4证券） |
+
+**常用返回字段**：`ts_code`, `ann_date`, `f_ann_date`, `end_date`, `report_type`, `comp_type`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 22. `balancesheet` - 资产负债表
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=36
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/balancesheet?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,f_ann_date,end_date,report_type,comp_type`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期(YYYYMMDD格式，下同) |
+| `start_date` | `str` | 否 | 公告日开始日期 |
+| `end_date` | `str` | 否 | 公告日结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期，比如20171231表示年报，20170630半年报，20170930三季报) |
+| `report_type` | `str` | 否 | 报告类型：见下方详细说明 |
+| `comp_type` | `str` | 否 | 公司类型：1一般工商业 2银行 3保险 4证券 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `f_ann_date`, `end_date`, `report_type`, `comp_type`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 23. `cashflow` - 现金流量表
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=44
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cashflow?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,f_ann_date,end_date,comp_type,report_type`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期（YYYYMMDD格式，下同） |
+| `f_ann_date` | `str` | 否 | 实际公告日期 |
+| `start_date` | `str` | 否 | 公告日开始日期 |
+| `end_date` | `str` | 否 | 公告日结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期，比如20171231表示年报，20170630半年报，20170930三季报) |
+| `report_type` | `str` | 否 | 报告类型：见下方详细说明 |
+| `comp_type` | `str` | 否 | 公司类型：1一般工商业 2银行 3保险 4证券 |
+| `is_calc` | `int` | 否 | 是否计算报表 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `f_ann_date`, `end_date`, `comp_type`, `report_type`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 24. `forecast` - 业绩预告
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=45
+**调用选择**：`ts_code` 与 `ann_date` 二选一；区间使用 `start_date`+`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/forecast?ts_code=000001.SZ&fields=ts_code,ann_date,end_date,type,p_change_min,p_change_max`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码(二选一) |
+| `ann_date` | `str` | 否 | 公告日期 (二选一) |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期，比如20171231表示年报，20170630半年报，20170930三季报) |
+| `type` | `str` | 否 | 预告类型(预增/预减/扭亏/首亏/续亏/续盈/略增/略减) |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `type`, `p_change_min`, `p_change_max`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 25. `express` - 业绩快报
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=46
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/express?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,end_date,revenue,operate_profit,total_profit`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期,比如20171231表示年报，20170630半年报，20170930三季报) |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `revenue`, `operate_profit`, `total_profit`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 26. `dividend` - 分红送股
+
+**用途**：全部历史，实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=103
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/dividend?ts_code=000001.SZ&fields=ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `ann_date` | `str` | 否 | 公告日 |
+| `record_date` | `str` | 否 | 股权登记日期 |
+| `ex_date` | `str` | 否 | 除权除息日 |
+| `imp_ann_date` | `str` | 否 | 实施公告日 |
+
+**常用返回字段**：`ts_code`, `end_date`, `ann_date`, `div_proc`, `stk_div`, `stk_bo_rate`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 27. `fina_indicator` - 财务指标数据
+
+**用途**：随财报实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=79
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fina_indicator?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,end_date,eps,dt_eps,total_revenue_ps`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | TS股票代码,e.g. 600001.SH/000001.SZ |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `start_date` | `str` | 否 | 报告期开始日期 |
+| `end_date` | `str` | 否 | 报告期结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期,比如20171231表示年报) |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `eps`, `dt_eps`, `total_revenue_ps`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 28. `fina_audit` - 财务审计意见
+
+**用途**：随财报实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=80
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fina_audit?ts_code=000001.SZ&period=20251231&fields=ts_code,ann_date,end_date,audit_result,audit_fees,audit_agency`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期,比如20171231表示年报) |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `audit_result`, `audit_fees`, `audit_agency`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 29. `fina_mainbz` - 主营业务构成
+
+**用途**：随财报实时更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=81
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fina_mainbz?ts_code=000001.SZ&period=20251231&type=P&fields=ts_code,end_date,bz_item,bz_code,bz_sales,bz_profit`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `period` | `str` | 否 | 报告期(每个季度最后一天的日期,比如20171231表示年报) |
+| `type` | `str` | 否 | 类型：P-按产品 D-按地区 I-按行业（请输入大写字母） |
+| `start_date` | `str` | 否 | 报告期开始日期 |
+| `end_date` | `str` | 否 | 报告期结束日期 |
+
+**常用返回字段**：`ts_code`, `end_date`, `bz_item`, `bz_code`, `bz_sales`, `bz_profit`。
+**特别注意**：`type` 只能使用大写 `P`（产品）、`D`（地区）或 `I`（行业）。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 30. `disclosure_date` - 财报披露计划
+
+**用途**：定期更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=162
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/disclosure_date?ts_code=000001.SZ&end_date=20251231&fields=ts_code,ann_date,end_date,pre_date,actual_date,modify_date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS股票代码 |
+| `end_date` | `str` | 否 | 财报周期（每个季度最后一天的日期，比如20181231表示2018年年报，20180630表示中报) |
+| `pre_date` | `str` | 否 | 计划披露日期 |
+| `ann_date` | `str` | 否 | 最新披露公告日 |
+| `actual_date` | `str` | 否 | 实际披露日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `pre_date`, `actual_date`, `modify_date`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 基金
+
+#### 31. `fund_basic` - 公募基金列表
+
+**用途**：全部历史，定时更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=19
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_basic?market=E&status=L&fields=ts_code,name,management,custodian,fund_type,found_date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 基金代码 |
+| `market` | `str` | 否 | 交易市场: E场内 O场外（默认E） |
+| `status` | `str` | 否 | 存续状态 D摘牌 I发行 L上市中 |
+
+**常用返回字段**：`ts_code`, `name`, `management`, `custodian`, `fund_type`, `found_date`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 32. `fund_company` - 公募基金公司
+
+**用途**：全部历史，定时更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=118
+**调用选择**：无筛选参数，直接调用。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_company?fields=name,shortname,short_enname,province,city,address`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| （无） | - | - | 直接调用；不要自行增加未定义筛选参数。 |
+
+**常用返回字段**：`name`, `shortname`, `short_enname`, `province`, `city`, `address`。
+**特别注意**：该接口无筛选参数，直接调用即可；不要强行添加 `ts_code`、日期等参数。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 33. `fund_nav` - 公募基金净值
+
+**用途**：每日定期更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=119
+**调用选择**：`ts_code` 与 `nav_date` 二选一；区间使用 `start_date`+`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_nav?ts_code=110011.OF&start_date=20250101&end_date=20251231&fields=ts_code,ann_date,nav_date,unit_nav,accum_nav,accum_div`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS基金代码 （二选一） |
+| `nav_date` | `str` | 否 | 净值日期 （二选一） |
+| `market` | `str` | 否 | E场内 O场外 |
+| `start_date` | `str` | 否 | 净值开始日期 |
+| `end_date` | `str` | 否 | 净值结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `nav_date`, `unit_nav`, `accum_nav`, `accum_div`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 34. `fund_daily` - 场内基金日线行情
+
+**用途**：每日盘后更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=127
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_daily?ts_code=510300.SH&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,open,high,low,close`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 基金代码 |
+| `trade_date` | `str` | 否 | 交易日期(YYYYMMDD格式，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `open`, `high`, `low`, `close`。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+#### 35. `fund_div` - 公募基金分红
+
+**用途**：定期更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=120
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_div?ts_code=110011.OF&fields=ts_code,ann_date,imp_anndate,base_date,div_proc,record_date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ann_date` | `str` | 否 | 公告日（以下参数四选一） |
+| `ex_date` | `str` | 否 | 除息日 |
+| `pay_date` | `str` | 否 | 派息日 |
+| `ts_code` | `str` | 否 | 基金代码 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `imp_anndate`, `base_date`, `div_proc`, `record_date`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 36. `fund_portfolio` - 公募基金持仓
+
+**用途**：股票持仓，定期采集。
+**积分提示**：清单标注最低积分 `5000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=121
+**调用选择**：`ts_code`、`ann_date`、`period` 至少提供一个；建议给基金代码和报告期。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_portfolio?ts_code=110011.OF&period=20251231&fields=ts_code,ann_date,end_date,symbol,mkv,amount`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 基金代码 (ts_code,ann_date,period至少输入一个参数) |
+| `symbol` | `str` | 否 | 股票代码 |
+| `ann_date` | `str` | 否 | 公告日期（YYYYMMDD格式） |
+| `period` | `str` | 否 | 季度（每个季度最后一天的日期，比如20131231表示2013年年报） |
+| `start_date` | `str` | 否 | 报告期开始日期（YYYYMMDD格式） |
+| `end_date` | `str` | 否 | 报告期结束日期（YYYYMMDD格式） |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `symbol`, `mkv`, `amount`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 37. `fund_adj` - 基金复权因子
+
+**用途**：每日17点更新。
+**积分提示**：清单标注最低积分 `5000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=199
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fund_adj?ts_code=510300.SH&trade_date=20260825&fields=ts_code,trade_date,adj_factor`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS基金代码（支持多只基金输入） |
+| `trade_date` | `str` | 否 | 交易日期（格式：yyyymmdd，下同） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+| `offset` | `str` | 否 | 开始行数 |
+| `limit` | `str` | 否 | 最大行数 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `adj_factor`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 期货
+
+#### 38. `fut_basic` - 期货合约列表
+
+**用途**：全部历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=135
+**调用选择**：`exchange` 必填，使用 `CFFEX`、`DCE`、`CZCE`、`SHFE`、`INE` 或 `GFEX`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fut_basic?exchange=CFFEX&fields=ts_code,symbol,exchange,name,fut_code,multiplier`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `exchange` | `str` | 是 | 交易所代码 CFFEX-中金所 DCE-大商所 CZCE-郑商所 SHFE-上期所 INE-上海国际能源交易中心 GFEX-广州期货交易所 |
+| `fut_type` | `str` | 否 | 合约类型 (1 普通合约 2主力与连续合约 默认取全部) |
+| `fut_code` | `str` | 否 | 标准合约代码，如白银AG、AP鲜苹果等 |
+| `list_date` | `str` | 否 | 上市开始日期(格式YYYYMMDD，从某日开始以来所有合约） |
+
+**常用返回字段**：`ts_code`, `symbol`, `exchange`, `name`, `fut_code`, `multiplier`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 39. `trade_cal` - 期货交易日历
+
+**用途**：1996年1月起。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=26
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/trade_cal?exchange=SSE&start_date=20260101&end_date=20261231&fields=exchange,cal_date,is_open,pretrade_date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `exchange` | `str` | 否 | 交易所 SSE上交所,SZSE深交所,CFFEX 中金所,SHFE 上期所,CZCE 郑商所,DCE 大商所,INE 上能源 |
+| `start_date` | `str` | 否 | 开始日期 （格式：YYYYMMDD 下同） |
+| `end_date` | `str` | 否 | 结束日期 |
+| `is_open` | `str` | 否 | 是否交易 '0'休市 '1'交易 |
+
+**常用返回字段**：`exchange`, `cal_date`, `is_open`, `pretrade_date`。
+**特别注意**：`exchange` 支持 SSE、SZSE、CFFEX、SHFE、CZCE、DCE、INE 等；返回的是日历日，不只包含开市日。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+#### 40. `fut_daily` - 期货日线行情
+
+**用途**：1996年1月起。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=138
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fut_daily?ts_code=CU.SHF&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,pre_close,pre_settle,open,high`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期(YYYYMMDD格式，下同) |
+| `ts_code` | `str` | 否 | 合约代码 |
+| `exchange` | `str` | 否 | 交易所代码 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `pre_close`, `pre_settle`, `open`, `high`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 41. `fut_holding` - 每日成交持仓排名
+
+**用途**：2002年1月起。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=139
+**调用选择**：`trade_date` 与 `symbol` 至少提供一个。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fut_holding?trade_date=20260825&symbol=CU&fields=trade_date,symbol,broker,vol,vol_chg,long_hld`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期 （trade_date/symbol至少输入一个参数） |
+| `symbol` | `str` | 否 | 合约或产品代码 |
+| `start_date` | `str` | 否 | 开始日期(YYYYMMDD格式，下同) |
+| `end_date` | `str` | 否 | 结束日期 |
+| `exchange` | `str` | 否 | 交易所代码 |
+
+**常用返回字段**：`trade_date`, `symbol`, `broker`, `vol`, `vol_chg`, `long_hld`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 42. `fut_wsr` - 仓单日报
+
+**用途**：2006年1月起。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=140
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fut_wsr?trade_date=20260825&symbol=CU&fields=trade_date,symbol,fut_name,warehouse,wh_id,pre_vol`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期 |
+| `symbol` | `str` | 否 | 产品代码 |
+| `start_date` | `str` | 否 | 开始日期(YYYYMMDD格式，下同) |
+| `end_date` | `str` | 否 | 结束日期 |
+| `exchange` | `str` | 否 | 交易所代码 |
+
+**常用返回字段**：`trade_date`, `symbol`, `fut_name`, `warehouse`, `wh_id`, `pre_vol`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 43. `fut_settle` - 结算参数
+
+**用途**：2012年1月起。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=141
+**调用选择**：`trade_date` 与 `ts_code` 至少提供一个。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fut_settle?trade_date=20260825&ts_code=CU.SHF&fields=ts_code,trade_date,settle,trading_fee_rate,trading_fee,delivery_fee`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期 （trade_date/ts_code至少需要输入一个参数） |
+| `ts_code` | `str` | 否 | 合约代码 |
+| `start_date` | `str` | 否 | 开始日期(YYYYMMDD格式，下同) |
+| `end_date` | `str` | 否 | 结束日期 |
+| `exchange` | `str` | 否 | 交易所代码 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `settle`, `trading_fee_rate`, `trading_fee`, `delivery_fee`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 指数
+
+#### 44. `index_daily` - 指数日线行情（清单另列“南华期货指数行情”）
+
+**用途**：超10年历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=95
+**调用选择**：`ts_code` 必填；代码请先从 `index_basic` 获取，单日用 `trade_date`，区间用成对的 `start_date`、`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_daily?ts_code=399300.SZ&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 指数代码，来源指数基础信息接口 |
+| `trade_date` | `str` | 否 | 交易日期 （日期格式：YYYYMMDD，下同） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `open`, `high`, `low`。
+**特别注意**：清单中该接口出现两次且名称不一致（“南华期货指数行情”和“指数日线行情”）；两行实际是同一个 API。官方文档 95 定义为各类指数日线行情，不包含申万行业指数，也不是期货合约行情。请使用 `index_basic` 返回的指数 `ts_code`（官方示例：`399300.SZ`）。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+### 期权
+
+#### 45. `opt_basic` - 期权合约列表
+
+**用途**：每日晚8点更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=158
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/opt_basic?exchange=SSE&fields=ts_code,symbol,exchange,name,per_unit,opt_code`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS期权代码 |
+| `exchange` | `str` | 否 | 交易所代码 （包括上交所SSE等交易所） |
+| `list_date` | `str` | 否 | 上市交易日 |
+| `opt_code` | `str` | 否 | 标准合约代码，OP+期货合约TS_CODE，如棕榈油2207合约，输入OPP2207.DCE |
+| `call_put` | `str` | 否 | 期权类型 |
+
+**常用返回字段**：`ts_code`, `symbol`, `exchange`, `name`, `per_unit`, `opt_code`。
+**特别注意**：`call_put` 等枚举值以官方当前文档为准；交易所代码常用 SSE、SZSE、CFFEX、DCE、SHFE、CZCE。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 46. `opt_daily` - 期权日线行情
+
+**用途**：每日17点更新。
+**积分提示**：清单标注最低积分 `5000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=159
+**调用选择**：代码或日期至少提供一个；可用 `exchange` 限定交易所。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/opt_daily?exchange=SSE&trade_date=20260825&fields=ts_code,trade_date,exchange,pre_settle,pre_close,open`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS合约代码（输入代码或时间至少任意一个参数） |
+| `trade_date` | `str` | 否 | 交易日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+| `exchange` | `str` | 否 | 交易所(SSE/SZSE/CFFEX/DCE/SHFE/CZCE） |
+
+**常用返回字段**：`ts_code`, `trade_date`, `exchange`, `pre_settle`, `pre_close`, `open`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 债券
+
+#### 47. `cb_basic` - 可转债基础信息
+
+**用途**：全部历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=185
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cb_basic?ts_code=110075.SH&fields=ts_code,bond_full_name,bond_short_name,cb_code,cb_type,stk_code`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 转债代码 |
+| `list_date` | `str` | 否 | 上市日期 |
+| `exchange` | `str` | 否 | 上市交易所 |
+
+**常用返回字段**：`ts_code`, `bond_full_name`, `bond_short_name`, `cb_code`, `cb_type`, `stk_code`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 48. `cb_issue` - 可转债发行数据
+
+**用途**：全部历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=186
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cb_issue?ts_code=110075.SH&fields=ts_code,ann_date,res_ann_date,plan_issue_size,issue_size,issue_price`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `ann_date` | `str` | 否 | 发行公告日 |
+| `start_date` | `str` | 否 | 公告开始日期 |
+| `end_date` | `str` | 否 | 公告结束日期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `res_ann_date`, `plan_issue_size`, `issue_size`, `issue_price`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 49. `cb_daily` - 可转债日线数据
+
+**用途**：每日17点更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=187
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cb_daily?ts_code=110075.SH&trade_date=20260825&fields=ts_code,trade_date,pre_close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `trade_date` | `str` | 否 | 交易日期(YYYYMMDD格式，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `pre_close`, `open`, `high`, `low`。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+### 外汇
+
+#### 50. `fx_obasic` - 外汇基础信息
+
+**用途**：全部历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=178
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fx_obasic?classify=FX&fields=ts_code,name,classify,exchange,min_unit,max_unit`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `exchange` | `str` | 否 | 交易商 |
+| `classify` | `str` | 否 | 分类 |
+| `ts_code` | `str` | 否 | TS代码 |
+
+**常用返回字段**：`ts_code`, `name`, `classify`, `exchange`, `min_unit`, `max_unit`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 51. `fx_daily` - 外汇日线行情
+
+**用途**：全部历史。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=179
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/fx_daily?ts_code=USDCNH&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,bid_open,bid_close,bid_high,bid_low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `trade_date` | `str` | 否 | 交易日期（GMT，日期是格林尼治时间，比北京时间晚一天） |
+| `start_date` | `str` | 否 | 开始日期（GMT） |
+| `end_date` | `str` | 否 | 结束日期（GMT） |
+| `exchange` | `str` | 否 | 交易商，目前只有FXCM |
+
+**常用返回字段**：`ts_code`, `trade_date`, `bid_open`, `bid_close`, `bid_high`, `bid_low`。
+**特别注意**：文档中的交易日期按 GMT 计，和北京时间可能相差一天。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 指数
+
+#### 52. `index_basic` - 指数基本信息
+
+**用途**：每日更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=94
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_basic?market=SSE&fields=ts_code,name,fullname,market,publisher,index_type`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS指数代码 |
+| `symbol` | `str` | 否 | 指数代码，支持多值输入，如000300,000001 |
+| `name` | `str` | 否 | 指数简称 |
+| `market` | `str` | 否 | 交易所或服务商(默认SSE，详见下方说明) |
+| `publisher` | `str` | 否 | 发布商 |
+| `category` | `str` | 否 | 指数类别 |
+
+**常用返回字段**：`ts_code`, `name`, `fullname`, `market`, `publisher`, `index_type`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 53. `index_weekly` - 指数周线行情
+
+**用途**：每周盘后更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=171
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_weekly?ts_code=000001.SH&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `trade_date` | `str` | 否 | 交易日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `open`, `high`, `low`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 54. `index_monthly` - 指数月线行情
+
+**用途**：每月盘后更新。
+**积分提示**：清单标注最低积分 `2000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=172
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_monthly?ts_code=000001.SH&start_date=20250101&end_date=20251231&fields=ts_code,trade_date,close,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `trade_date` | `str` | 否 | 交易日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `close`, `open`, `high`, `low`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 55. `index_weight` - 指数成分和权重
+
+**用途**：月度数据。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=96
+**调用选择**：`index_code` 必填；单日或区间用 `trade_date` 或 `start_date`+`end_date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_weight?index_code=000300.SH&trade_date=20260825&fields=index_code,con_code,trade_date,weight`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `index_code` | `str` | 是 | 指数代码，来源指数基础信息接口 |
+| `trade_date` | `str` | 否 | 交易日期（格式YYYYMMDD，下同） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `None` | 否 | 结束日期 |
+
+**常用返回字段**：`index_code`, `con_code`, `trade_date`, `weight`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 56. `index_dailybasic` - 大盘指数每日指标
+
+**用途**：2004年1月起。
+**积分提示**：清单标注最低积分 `4000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=128
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_dailybasic?ts_code=000001.SH&trade_date=20260825&fields=ts_code,trade_date,total_mv,float_mv,total_share,float_share`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trade_date` | `str` | 否 | 交易日期 （格式：YYYYMMDD，比如20181018，下同） |
+| `ts_code` | `str` | 否 | TS代码 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `total_mv`, `float_mv`, `total_share`, `float_share`。
+**本服务器行为**：已验证本地 SQLite 快路径（符合完整性条件的请求）；重复请求可命中 Redis。未满足本地条件的形状会自动回源。
+
+---
+
+#### 57. `index_classify` - 申万行业分类
+
+**用途**：全部分类。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=181
+**调用选择**：所有筛选参数均可选；推荐 `src=SW2021` 配合 `level=L1/L2/L3`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_classify?src=SW2021&level=L1&fields=index_code,industry_name,parent_code,level,industry_code,is_pub`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `index_code` | `str` | 否 | 指数代码 |
+| `level` | `str` | 否 | 行业分级（L1/L2/L3） |
+| `parent_code` | `str` | 否 | 父级代码（一级为0） |
+| `src` | `str` | 否 | 指数来源（SW2014：申万2014年版本，SW2021：申万2021年版本） |
+
+**常用返回字段**：`index_code`, `industry_name`, `parent_code`, `level`, `industry_code`, `is_pub`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 58. `index_member_all` - 申万行业成分
+
+**用途**：全部数据。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=335
+**调用选择**：筛选参数均可选；推荐给行业代码并用 `is_new=Y` 获取最新成分。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/index_member_all?l1_code=110000&is_new=Y&fields=l1_code,l1_name,l2_code,l2_name,l3_code,l3_name`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `l1_code` | `str` | 否 | 一级行业代码 |
+| `l2_code` | `str` | 否 | 二级行业代码 |
+| `l3_code` | `str` | 否 | 三级行业代码 |
+| `ts_code` | `str` | 否 | 股票代码 |
+| `is_new` | `str` | 否 | 是否最新（默认为“Y是”） |
+
+**常用返回字段**：`l1_code`, `l1_name`, `l2_code`, `l2_name`, `l3_code`, `l3_name`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 港股
+
+#### 59. `hk_basic` - 港股列表
+
+**用途**：全部历史，每日更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=191
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/hk_basic?list_status=L&fields=ts_code,name,fullname,enname,cn_spell,market`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | TS代码 |
+| `list_status` | `str` | 否 | 上市状态 L上市 D退市 P暂停上市 ，默认L |
+
+**常用返回字段**：`ts_code`, `name`, `fullname`, `enname`, `cn_spell`, `market`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 宏观
+
+#### 60. `shibor` - SHIBOR利率数据
+
+**用途**：2006年起，每日12点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=149
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/shibor?date=20260825&fields=date,on`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 (日期输入格式：YYYYMMDD，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`date`, `on`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 61. `shibor_quote` - SHIBOR报价数据
+
+**用途**：2006年起，每日12点。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=150
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/shibor_quote?date=20260825&bank=%E5%86%9C%E4%B8%9A%E9%93%B6%E8%A1%8C&fields=date,bank,on_b,on_a`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 (日期输入格式：YYYYMMDD，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+| `bank` | `str` | 否 | 银行名称 （中文名称，例如 农业银行） |
+
+**常用返回字段**：`date`, `bank`, `on_b`, `on_a`。
+**特别注意**：`bank` 使用中文银行名称；日期字段使用 `YYYYMMDD`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 62. `shibor_lpr` - LPR贷款基础利率
+
+**用途**：2013年起，每日12点。
+**积分提示**：清单标注最低积分 `120`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=151
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/shibor_lpr?date=20260825&fields=date`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 (日期输入格式：YYYYMMDD，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`date`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 63. `libor` - LIBOR拆借利率
+
+**用途**：1986年起，每日12点。
+**积分提示**：清单标注最低积分 `120`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=152
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/libor?date=20260825&curr_type=USD&fields=date,curr_type,on`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 (日期输入格式：YYYYMMDD，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+| `curr_type` | `str` | 否 | 货币代码 (USD美元 EUR欧元 JPY日元 GBP英镑 CHF瑞郎，默认是USD) |
+
+**常用返回字段**：`date`, `curr_type`, `on`。
+**特别注意**：`curr_type` 常用值为 USD、EUR、JPY、GBP、CHF。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 64. `hibor` - HIBOR拆借利率
+
+**用途**：2002年起，每日12点。
+**积分提示**：清单标注最低积分 `120`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=153
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/hibor?date=20260825&fields=date,on`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 (日期输入格式：YYYYMMDD，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`date`, `on`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 65. `wz_index` - 温州民间借贷利率
+
+**用途**：不定期更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=173
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/wz_index?date=20260825&fields=date,comp_rate,center_rate,micro_rate,cm_rate,sdb_rate`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`date`, `comp_rate`, `center_rate`, `micro_rate`, `cm_rate`, `sdb_rate`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 66. `gz_index` - 广州民间借贷利率
+
+**用途**：不定期更新。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=174
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/gz_index?date=20260825&fields=date,d10_rate,m1_rate,m3_rate,m6_rate,m12_rate`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 日期 |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`date`, `d10_rate`, `m1_rate`, `m3_rate`, `m6_rate`, `m12_rate`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 行业特色
+
+#### 67. `tmt_twincome` - 台湾电子产业月营收
+
+**用途**：2011年起，月度更新。
+**积分提示**：清单标注最低积分 `0`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=88
+**调用选择**：`item`（产品代码）必填；日期可用报告期或开始/结束区间。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/tmt_twincome?item=1&start_date=20250101&end_date=20251231&fields=date,item,op_income`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 报告期 |
+| `item` | `str` | 是 | 产品代码 |
+| `start_date` | `str` | 否 | 报告期开始日期 |
+| `end_date` | `str` | 否 | 报告期结束日期 |
+
+**常用返回字段**：`date`, `item`, `op_income`。
+**特别注意**：`item` 是产品代码，不是股票代码；例如 1 表示 PC。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 68. `tmt_twincomedetail` - 台湾电子产业月营收明细
+
+**用途**：2011年起，月度更新。
+**积分提示**：清单标注最低积分 `0`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=87
+**调用选择**：建议至少提供 `symbol` 或 `item`，并配合月份区间。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/tmt_twincomedetail?symbol=2330&start_date=20250101&end_date=20251231&fields=date,item,symbol,op_income,consop_income`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 否 | 报告期 |
+| `item` | `str` | 否 | 产品代码 |
+| `symbol` | `str` | 否 | 公司代码 |
+| `start_date` | `str` | 否 | 报告期开始日期 |
+| `end_date` | `str` | 否 | 报告期结束日期 |
+| `source` | `str` | 否 | None |
+
+**常用返回字段**：`date`, `item`, `symbol`, `op_income`, `consop_income`。
+**特别注意**：`symbol` 是台湾公司代码，不能填 A 股代码。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 69. `bo_monthly` - 电影月度票房
+
+**用途**：2008年起，月度更新。
+**积分提示**：清单标注最低积分 `500`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=113
+**调用选择**：必填：`date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/bo_monthly?date=20260801&fields=date,name,list_date,avg_price,month_amount,list_day`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 是 | 日期（每月1号，格式YYYYMMDD） |
+
+**常用返回字段**：`date`, `name`, `list_date`, `avg_price`, `month_amount`, `list_day`。
+**特别注意**：`date` 使用每月 1 日，例如 20260801。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 70. `bo_weekly` - 电影周度票房
+
+**用途**：2008年起，每周更新。
+**积分提示**：清单标注最低积分 `500`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=114
+**调用选择**：必填：`date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/bo_weekly?date=20260824&fields=date,name,avg_price,week_amount,total,list_day`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 是 | 日期（每周一日期，格式YYYYMMDD） |
+
+**常用返回字段**：`date`, `name`, `avg_price`, `week_amount`, `total`, `list_day`。
+**特别注意**：`date` 使用每周一日期，例如 20260824。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 71. `bo_daily` - 电影日度票房
+
+**用途**：2018年起，每日更新。
+**积分提示**：清单标注最低积分 `500`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=115
+**调用选择**：必填：`date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/bo_daily?date=20260825&fields=date,name,avg_price,day_amount,total,list_day`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 是 | 日期 （格式YYYYMMDD） |
+
+**常用返回字段**：`date`, `name`, `avg_price`, `day_amount`, `total`, `list_day`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 72. `bo_cinema` - 影院每日票房
+
+**用途**：2018年起，每日更新。
+**积分提示**：清单标注最低积分 `500`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=116
+**调用选择**：必填：`date`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/bo_cinema?date=20260825&fields=date,c_name,aud_count,att_ratio,day_amount,day_showcount`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `date` | `str` | 是 | 日期(格式:YYYYMMDD) |
+
+**常用返回字段**：`date`, `c_name`, `aud_count`, `att_ratio`, `day_amount`, `day_showcount`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 73. `film_record` - 全国电影剧本备案
+
+**用途**：2011年起，定期更新。
+**积分提示**：清单标注最低积分 `120起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=156
+**调用选择**：至少提供 `ann_date`、`start_date`、`end_date` 中的一个。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/film_record?start_date=20260101&end_date=20261231&fields=rec_no,film_name,rec_org,script_writer,rec_result,rec_area`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ann_date` | `str` | 否 | 公布日期 （至少输入一个参数，格式：YYYYMMDD，日期不连续，定期公布） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`rec_no`, `film_name`, `rec_org`, `script_writer`, `rec_result`, `rec_area`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 74. `teleplay_record` - 全国电视剧本备案
+
+**用途**：2009年起，定期更新。
+**积分提示**：清单标注最低积分 `600起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=180
+**调用选择**：筛选参数均可选；月份格式为 `YYYYMM`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/teleplay_record?start_date=202601&end_date=202612&fields=name,classify,types,org,report_date,license_key`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `report_date` | `str` | 否 | 备案月份（YYYYMM） |
+| `start_date` | `str` | 否 | 备案开始月份（YYYYMM） |
+| `end_date` | `str` | 否 | 备案结束月份（YYYYMM） |
+| `org` | `str` | 否 | 备案机构 |
+| `name` | `str` | 否 | 电视剧名称 |
+
+**常用返回字段**：`name`, `classify`, `types`, `org`, `report_date`, `license_key`。
+**特别注意**：该接口日期按月份输入（`YYYYMM`），不要填八位日历日期。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+### 特色
+
+#### 75. `report_rc` - 券商(卖方)盈利预测
+
+**用途**：2010年起，每日20点更新。
+**积分提示**：清单标注最低积分 `10000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=292
+**调用选择**：筛选参数均可选；建议至少提供一个代码、日期或市场条件，避免返回过大的结果集。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/report_rc?ts_code=000001.SZ&start_date=20250101&end_date=20251231&fields=ts_code,name,report_date,report_title,report_type,classify`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 |
+| `report_date` | `str` | 否 | 报告日期 |
+| `start_date` | `str` | 否 | 报告开始日期 |
+| `end_date` | `str` | 否 | 报告结束日期 |
+
+**常用返回字段**：`ts_code`, `name`, `report_date`, `report_title`, `report_type`, `classify`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 76. `cyq_perf` - 每日筹码成本和胜率
+
+**用途**：各分位持仓成本、加权均价、胜率。
+**积分提示**：清单标注最低积分 `10000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=293
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cyq_perf?ts_code=000001.SZ&trade_date=20260825&fields=ts_code,trade_date,his_low,his_high,cost_5pct,cost_15pct`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `trade_date` | `str` | 否 | 交易日期（YYYYMMDD） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `his_low`, `his_high`, `cost_5pct`, `cost_15pct`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 77. `cyq_chips` - 每日筹码分布
+
+**用途**：成本价上下各50档分布。
+**积分提示**：清单标注最低积分 `10000起`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=294
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/cyq_chips?ts_code=000001.SZ&trade_date=20260825&fields=ts_code,trade_date,price,percent`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | 股票代码 |
+| `trade_date` | `str` | 否 | 交易日期（YYYYMMDD） |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `price`, `percent`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 78. `stk_rewards` - 券商金股
+
+**用途**：每月末发布下月十大金股。
+**积分提示**：清单标注最低积分 `2000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=194
+**调用选择**：必填：`ts_code`。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_rewards?ts_code=000001.SZ&end_date=20251231&fields=ts_code,ann_date,end_date,name,title,reward`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 是 | TS股票代码，支持单个或多个代码输入 |
+| `end_date` | `str` | 否 | 报告期 |
+
+**常用返回字段**：`ts_code`, `ann_date`, `end_date`, `name`, `title`, `reward`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 79. `stk_factor_pro` - 技术面因子
+
+**用途**：QFQ技术面因子。
+**积分提示**：清单标注最低积分 `8000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=328
+**调用选择**：请按参数描述提供至少一个业务筛选条件；区间查询的开始和结束日期必须成对出现。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_factor_pro?ts_code=000001.SZ&trade_date=20260825&fields=ts_code,trade_date,open,open_hfq,open_qfq,high`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码ts_code,trade_date至少输入一个参数 |
+| `trade_date` | `str` | 否 | 交易日期(格式：yyyymmdd，下同) |
+| `start_date` | `str` | 否 | 开始日期 |
+| `end_date` | `str` | 否 | 结束日期 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `open`, `open_hfq`, `open_qfq`, `high`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+#### 80. `stk_nineturn` - 神奇九转(TD序列)
+
+**用途**：21:00更新。
+**积分提示**：清单标注最低积分 `6000`；本代理能路由不等于客户账号已开通上游权限。
+**官方参数文档**：https://tushare.pro/document/2?doc_id=364
+**调用选择**：建议给 `ts_code`、`freq=daily` 和时间区间；日期可能包含时间戳。
+
+**推荐请求**：
+
+`GET {BASE_URL}/app-api/openapi/v1/tushare/stk_nineturn?ts_code=000001.SZ&freq=daily&start_date=20260101&end_date=20260825&fields=ts_code,trade_date,freq,open,high,low`
+
+**输入参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ts_code` | `str` | 否 | 股票代码 |
+| `trade_date` | `str` | 否 | 交易日期 （格式：YYYY-MM-DD HH:MM:SS) |
+| `freq` | `str` | 否 | 频率(日daily) |
+| `start_date` | `str` | 否 | 开始时间 |
+| `end_date` | `str` | 否 | 结束时间 |
+
+**常用返回字段**：`ts_code`, `trade_date`, `freq`, `open`, `high`, `low`。
+**本服务器行为**：默认走上游账号池；符合缓存策略的成功响应可能命中 Redis，但不承诺本地覆盖。
+
+---
+
+## 6. 错误信息与处理方式
+
+| HTTP | `code`/现象 | 含义 | 客户处理 |
+|---:|---|---|---|
+| 400 | `invalid api name`、`fields must be a string` | URL、字段或请求格式错误 | 检查接口名、字段名和 JSON/查询参数类型 |
+| 401 | `missing X-API-Key`、`invalid, disabled or expired token` | 未带客户密钥或密钥无效 | 只使用 `X-API-Key`，确认密钥状态和过期时间 |
+| 200 | `code=0`、`items=[]` | 请求成功但没有数据 | 检查代码、日期、交易所和权限，不要当成服务器错误 |
+| 502 | `Tushare request failed` | 上游权限、参数、频率或网络失败 | 记录 `X-Request-Id`，先看 `msg`；不要盲目改成另一个接口 |
+| 503 | `authentication service temporarily unavailable` | 鉴权后端临时不可用 | 稍后重试并保留请求 ID |
+
+### 最常见的 10 个写错方式
+
+1. 把 `token` 放进 URL；正确做法是请求头 `X-API-Key`。
+2. 把 `000001` 当成完整代码；A 股应写 `000001.SZ`，上交所股票应写 `600000.SH`。
+3. 日期写成 `2026-08-25`；行情接口通常要求 `20260825`。
+4. 只写 `start_date` 不写 `end_date`。
+5. 同时写 `trade_date`、`start_date`、`end_date`。
+6. 把财报期写成 `2025Q4`；应写 `20251231`。
+7. `offset=100` 却不写 `limit`。
+8. `fields` 中重复字段、使用连字符或夹带空格。
+9. 把指数代码、基金代码、期货合约代码当股票代码使用。
+10. 把上游“无权限/频率超限”误认为本网关限流；本项目没有添加客户侧限流。
+
+## 7. 分页示例
+
+```python
+def fetch_all(base_url, api_key, api, fixed_params, fields):
+    rows = []
+    offset = 0
+    while True:
+        params = {**fixed_params, "limit": 5000, "offset": offset, "fields": fields}
+        r = requests.get(f"{base_url}/app-api/openapi/v1/tushare/{api}", headers={"X-API-Key": api_key}, params=params, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("code") != 0:
+            raise RuntimeError(body.get("msg"))
+        batch = body.get("data", {}).get("items", [])
+        rows.extend(batch)
+        if len(batch) < 5000:
+            break
+        offset += 5000
+    return rows
+```
+
+分页时每一页都要保留相同的业务筛选条件和 `fields`，只递增 `offset`。若上游接口自身限制更小，以返回错误提示为准。
+
+## 8. 上线前检查清单
+
+- [ ] 已把 `BASE_URL` 和客户密钥放入环境变量，而不是写死在源码。
+- [ ] 已为每次请求生成唯一 `X-Request-Id`，并在错误时保存。
+- [ ] 已确认 `ts_code` 后缀、交易所代码和日期格式。
+- [ ] 已确认区间参数成对，分页参数为非负整数。
+- [ ] 已先读取 `data.fields` 再解析 `items`。
+- [ ] 已把空结果与错误分开处理。
+- [ ] 对 `pro_bar`、`hk_hold` 等特殊/历史接口已单独验证权限和协议。
+
+## 9. 重要边界
+
+清单共有 81 行、80 个唯一 API（`index_daily` 重复一次）。目前服务器已用真实数据和 HTTP 请求验收 9 个本地接口族：`daily`、`daily_basic`、`adj_factor`、`index_daily`、`index_dailybasic`、`fund_daily`、`cb_daily`、`stock_basic`、`trade_cal`。其余接口仍以 Tushare 上游权限、参数和频率返回为准；“清单标注可用”不能替代客户账号的实际授权。
+
+本手册中的示例日期用于演示格式，不保证每个日期都有数据；请按交易日历和接口更新时点替换。

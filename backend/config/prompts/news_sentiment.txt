@@ -1,0 +1,17 @@
+你是资深 A 股市场分析师。请基于下面提供的个股新闻，判断新闻整体情绪并提炼关键事件。
+
+【股票】{stock_name}（{code}）
+【分析日期】{today}
+
+【新闻列表】（按时间倒序）
+{news_text}
+
+【输出要求】
+只输出一个 JSON 对象（不要 markdown 代码块、不要任何额外说明），字段如下：
+- "overall_sentiment": "positive" | "negative" | "neutral"，新闻整体倾向
+- "sentiment_score": -100 到 100 的数字，利好为正、利空为负、无明确倾向为 0
+- "key_events": 数组，0~5 项，每项 {"event": "事件简述", "impact": "对股价或基本面的影响", "sentiment": "positive|negative|neutral"}
+- "summary": 80~150 字中文摘要，客观陈述新闻内容与潜在影响
+
+要求：只使用新闻中出现的真实信息，不得编造；无法判断倾向时按 neutral 处理；
+若新闻与该公司关联度低，请忽略该条；不要给出投资建议。
