@@ -1,18 +1,23 @@
 """SQLAlchemy 异步引擎 + ORM 模型 + 自动建表。
 
-数据库: SQLite (stockpanel.db)，位于系统应用数据目录。
+数据库: 优先 MySQL（backend/.env 中 MYSQL_* 配置，驱动 aiomysql）；
+MYSQL_HOST 未配置时回退 SQLite (stockpanel.db，位于系统应用数据目录)。
+连接信息（密码/IP/库名）只来自配置，不入日志。
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 _CST = timezone(timedelta(hours=8))  # 全系统统一东八区时间戳
 
-from sqlalchemy import String, Text, Float, Integer
+from sqlalchemy import String, Text, Float, Integer, UniqueConstraint, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from config import settings
+
+logger = logging.getLogger("stockpanel.database")
 
 
 class Base(DeclarativeBase):
@@ -71,6 +76,28 @@ class ReportHistory(Base):
     created_at: Mapped[str] = mapped_column(String(32), default=lambda: datetime.now(_CST).isoformat())
 
 
+class KlineMinute(Base):
+    """分钟级K线数据（5min/15min/30min/60min）"""
+
+    __tablename__ = "kline_minute"
+    __table_args__ = (
+        # 防重复采集入库；查询按 stock_code+freq+时间范围
+        UniqueConstraint("stock_code", "freq", "trade_time", name="uq_kline_minute"),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    freq: Mapped[str] = mapped_column(String(8), nullable=False, default="5min")
+    trade_time: Mapped[str] = mapped_column(String(32), nullable=False)
+    open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
@@ -78,8 +105,36 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 def get_engine():
     global _engine
     if _engine is None:
-        _engine = create_async_engine(f"sqlite+aiosqlite:///{settings.DB_PATH}", echo=False)
+        url = settings.database_url()
+        if url.startswith("mysql"):
+            # pool_pre_ping + pool_recycle: MySQL wait_timeout 回收空闲连接后自愈
+            _engine = create_async_engine(
+                url, echo=False, pool_pre_ping=True, pool_recycle=3600
+            )
+        else:
+            _engine = create_async_engine(url, echo=False)
     return _engine
+
+
+async def _ensure_mysql_database() -> None:
+    """MySQL: 目标库不存在时尝试自动创建（无权限时告警，由后续建表报真实错误）。"""
+    url = settings.mysql_url(with_db=False)
+    if url is None:
+        return
+    dbname = settings.MYSQL_DATABASE.replace("`", "")  # 防注入: 标识符转义
+    try:
+        engine = create_async_engine(url, echo=False)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    f"CREATE DATABASE IF NOT EXISTS `{dbname}` "
+                    f"CHARACTER SET {settings.MYSQL_CHARSET}"
+                ))
+        finally:
+            await engine.dispose()
+        logger.info("MySQL 数据库已就绪: %s", dbname)
+    except Exception as exc:
+        logger.warning("预建数据库失败（%s: %s），若库已存在可忽略", type(exc).__name__, exc)
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -92,6 +147,8 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 async def init_db() -> None:
     """建库建表（幂等）。"""
     settings.ensure_dirs()
+    if settings.is_mysql():
+        await _ensure_mysql_database()
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
