@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Alert, Card, Progress, Typography, message } from 'antd'
+import { Alert, Card } from 'antd'
+import CollectCard from './CollectCard'
 import SearchPanel from './SearchPanel'
 import ReportView from './ReportView'
 import { streamReport } from '@/services/api'
@@ -15,6 +16,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 export default function StockAnalysis() {
+  const [collecting, setCollecting] = useState<StockBrief | null>(null)
   const [selected, setSelected] = useState<StockBrief | null>(null)
   const [progress, setProgress] = useState<ReportProgressEvent | null>(null)
   const [report, setReport] = useState<StockReport | null>(null)
@@ -26,9 +28,23 @@ export default function StockAnalysis() {
     cancelRef.current = null
   }, [])
 
-  const start = useCallback(
+  // 搜索面板点击：进入采集阶段
+  const handleSelect = useCallback(
     (stock: StockBrief) => {
       cancel()
+      setCollecting(stock)
+      setSelected(null)
+      setReport(null)
+      setError(null)
+      setProgress(null)
+    },
+    [cancel]
+  )
+
+  // 采集完成：进入报告生成阶段
+  const handleCollectComplete = useCallback(
+    (stock: StockBrief) => {
+      setCollecting(null)
       setSelected(stock)
       setReport(null)
       setError(null)
@@ -53,7 +69,23 @@ export default function StockAnalysis() {
 
   return (
     <div style={{ height: '100%', overflow: 'auto', padding: '14px 18px' }}>
-      {selected === null && <SearchPanel onSelect={start} />}
+      {/* 搜索面板：无采集、无报告时显示 */}
+      {collecting === null && selected === null && (
+        <SearchPanel onSelect={handleSelect} />
+      )}
+
+      {/* 采集阶段：显示 CollectCard */}
+      {collecting !== null && (
+        <div style={{ maxWidth: 560, margin: '80px auto' }}>
+          <div style={{ marginBottom: 10 }}>
+            <a onClick={() => { setCollecting(null) }} style={{ fontSize: 12 }}>
+              ← 重新搜索
+            </a>
+          </div>
+          <h3 style={{ marginBottom: 8 }}>数据采集</h3>
+          <CollectCard stock={collecting} onComplete={handleCollectComplete} />
+        </div>
+      )}
 
       {generating && (
         <div
@@ -84,13 +116,20 @@ export default function StockAnalysis() {
       )}
 
       {error && (
-        <Alert
-          type="error"
-          showIcon
-          message={`报告生成失败`}
-          description={error}
-          style={{ maxWidth: 560, margin: '80px auto' }}
-        />
+        <>
+          <div style={{ marginBottom: 10 }}>
+            <a onClick={() => { setSelected(null); setError(null) }} style={{ fontSize: 12 }}>
+              ← 重新搜索
+            </a>
+          </div>
+          <Alert
+            type="error"
+            showIcon
+            message={`报告生成失败`}
+            description={error}
+            style={{ maxWidth: 560, margin: '40px auto' }}
+          />
+        </>
       )}
 
       {hasReportError && (
