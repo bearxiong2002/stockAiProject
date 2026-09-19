@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { StockBrief } from '@/types'
+import type { CollectCheckResult, CollectStatus, StockBrief } from '@/types'
 
 const api = axios.create({
   baseURL: '/api',
@@ -331,5 +331,37 @@ export async function getPortfolioAiAdvice(force = false): Promise<PortfolioAiAd
     params: force ? { force: true } : undefined,
     timeout: 120000
   })
+  return data
+}
+
+// ---------- 分钟K线数据采集 ----------
+
+export async function startCollect(
+  code: string,
+  name: string,
+  years = 3,
+  freq = '5min'
+): Promise<CollectStatus> {
+  const { data } = await api.post<CollectStatus>(
+    `/collect/${code}/start`,
+    null,
+    { params: { name, years, freq } }
+  )
+  return data
+}
+
+export async function getCollectStatus(code: string): Promise<CollectStatus> {
+  const { data } = await api.get<CollectStatus>(`/collect/${code}/status`)
+  return data
+}
+
+export async function checkCollectData(
+  code: string,
+  freq = '5min'
+): Promise<CollectCheckResult> {
+  const { data } = await api.get<CollectCheckResult>(
+    `/collect/${code}/check`,
+    { params: { freq } }
+  )
   return data
 }

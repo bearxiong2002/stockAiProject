@@ -423,3 +423,30 @@ export interface DataSourceStatus {
     results: DataSourceCapabilityResult[]
   } | null
 }
+
+// =====================================================================
+// 分钟K线数据采集
+// =====================================================================
+
+export interface CollectStatus {
+  stock_code: string
+  stock_name: string
+  freq: string
+  years: number
+  status: 'idle' | 'collecting' | 'completed' | 'error'
+  progress: number
+  message: string
+  total_months: number
+  fetched_months: number
+  total_rows: number
+  error: string | null
+}
+
+export interface CollectCheckResult {
+  stock_code: string
+  freq: string
+  exists: boolean
+  row_count: number
+  min_time: string | null
+  max_time: string | null
+}
