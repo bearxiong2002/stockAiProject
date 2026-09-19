@@ -55,8 +55,9 @@ async def lifespan(app: FastAPI):
     from services.llm_config import load_llm_config
     await load_llm_config()
     logging.getLogger("stockpanel").info(
-        "backend started, db=%s, static=%s",
-        settings.DB_PATH,
+        "backend started, db=%s (%s), static=%s",
+        settings.db_description(),
+        "mysql" if settings.is_mysql() else "sqlite",
         settings.SERVE_STATIC and (settings.FRONTEND_DIST / "index.html").is_file(),
     )
     yield
@@ -94,6 +95,7 @@ async def data_source_error_handler(request, exc: DataSourceError):
 
 
 # API 路由
+from api import collect as collect_api  # noqa: E402
 from api import config as config_api  # noqa: E402
 from api import market as market_api  # noqa: E402
 from api import portfolio as portfolio_api  # noqa: E402
@@ -102,6 +104,7 @@ from api import watchlist as watchlist_api  # noqa: E402
 
 app.include_router(stock_api.router)
 app.include_router(config_api.router)
+app.include_router(collect_api.router)
 app.include_router(portfolio_api.router)
 app.include_router(watchlist_api.router)
 app.include_router(market_api.router)
