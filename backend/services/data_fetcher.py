@@ -813,7 +813,51 @@ class DataFetcher:
         return out
 
     # ------------------------------------------------------------------
-    # 12. get_stock_news（可选能力；无关联新闻 → 空表 + warning）
+    # 12. get_chip_distribution（筹码分布；仅 ProMax 支持）
+    # ------------------------------------------------------------------
+
+    def get_chip_distribution(self, code: str, trade_date: str | None = None) -> dict:
+        """获取筹码分布数据。返回 {trade_date, items: [{price, percent}], perf: {...}}。"""
+        ts = ts_code_of(code)
+        if not trade_date:
+            trade_date = self._as_of()
+
+        self._check_source("promax")
+        chips_fetch = self._pm.cyq_chips(ts, trade_date)
+        chips_df = self._df(chips_fetch)
+
+        if chips_df.empty:
+            return {"trade_date": trade_date, "items": [], "perf": None}
+
+        items = []
+        for _, row in chips_df.iterrows():
+            p = num(row.get("price"))
+            pct = num(row.get("percent"))
+            if p is not None and pct is not None:
+                items.append({"price": round(p, 2), "percent": round(pct, 4)})
+        items.sort(key=lambda x: x["price"])
+
+        perf = None
+        try:
+            perf_fetch = self._pm.cyq_perf(ts, trade_date)
+            perf_df = self._df(perf_fetch)
+            if not perf_df.empty:
+                r = perf_df.iloc[0]
+                perf = {
+                    "cost_5pct": num(r.get("cost_5pct")),
+                    "cost_15pct": num(r.get("cost_15pct")),
+                    "cost_85pct": num(r.get("cost_85pct")),
+                    "cost_95pct": num(r.get("cost_95pct")),
+                    "weight_avg": num(r.get("weight_avg")),
+                    "winner_rate": num(r.get("winner_rate")),
+                }
+        except Exception:
+            pass
+
+        return {"trade_date": trade_date, "items": items, "perf": perf}
+
+    # ------------------------------------------------------------------
+    # 13. get_stock_news（可选能力；无关联新闻 → 空表 + warning）
     # ------------------------------------------------------------------
 
     def get_stock_news(self, code: str) -> pd.DataFrame:

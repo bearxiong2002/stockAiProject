@@ -18,6 +18,7 @@ import tempfile
 _TMP = tempfile.mkdtemp(prefix="stockpanel_p8_")
 os.environ["STOCK_DATA_MODE"] = "mock"
 os.environ["STOCKPANEL_DATA_DIR"] = _TMP
+os.environ["MYSQL_HOST"] = ""                  # 锁定 SQLite 回退，不受 backend/.env 影响
 os.environ.pop("LLM_PROVIDER", None)
 os.environ.pop("LLM_API_KEY", None)
 
@@ -521,7 +522,7 @@ def test_apis():
                               and "sk-secret" not in resp.model_dump_json())
         checks["模型保存"] = resp.llm.model == "claude-test-model"
         checks["默认 base 补全"] = resp.llm.api_base == "https://api.anthropic.com"
-        checks["来源标记 sqlite"] = resp.llm.sources.get("provider") == "sqlite"
+        checks["来源标记 db"] = resp.llm.sources.get("provider") == "db"
 
         # -- 加密落库（DB 中无明文）------------------------------------
         from models.database import ConfigItem, get_session_factory

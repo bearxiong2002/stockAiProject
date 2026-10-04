@@ -267,6 +267,20 @@ class ProMaxSource(SourceClient):
             **params,
             "fields": "trade_date,close_sh,pct_change_sh,close_sz,pct_change_sz,net_amount,net_amount_rate,buy_elg_amount,buy_elg_amount_rate,buy_lg_amount,buy_lg_amount_rate,buy_md_amount,buy_md_amount_rate,buy_sm_amount,buy_sm_amount_rate"})
 
+    # -- 筹码分布 ---------------------------------------------------------------
+
+    def cyq_chips(self, ts_code: str, trade_date: str) -> FetchResult:
+        params = self.formal_params("cyq_chips", {
+            "ts_code": ts_code, "trade_date": trade_date})
+        return self.get_rows("cyq_chips", {**params, "fields": "ts_code,trade_date,price,percent"})
+
+    def cyq_perf(self, ts_code: str, trade_date: str) -> FetchResult:
+        params = self.formal_params("cyq_perf", {
+            "ts_code": ts_code, "trade_date": trade_date})
+        return self.get_rows("cyq_perf", {
+            **params,
+            "fields": "ts_code,trade_date,his_low,his_high,cost_5pct,cost_15pct,cost_25pct,cost_75pct,cost_85pct,cost_95pct,weight_avg,winner_rate"})
+
     # -- 申万行业 / 新闻 -----------------------------------------------------
 
     def sw_daily(self, ts_code: str | None = None, trade_date: str | None = None,

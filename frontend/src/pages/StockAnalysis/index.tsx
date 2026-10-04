@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, Card } from 'antd'
-import CollectCard from './CollectCard'
 import SearchPanel from './SearchPanel'
+import CollectCard from './CollectCard'
 import ReportView from './ReportView'
 import { streamReport } from '@/services/api'
 import type { ReportProgressEvent, StockBrief, StockReport } from '@/types'
@@ -16,8 +16,8 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 export default function StockAnalysis() {
-  const [collecting, setCollecting] = useState<StockBrief | null>(null)
   const [selected, setSelected] = useState<StockBrief | null>(null)
+  const [collecting, setCollecting] = useState(false)
   const [progress, setProgress] = useState<ReportProgressEvent | null>(null)
   const [report, setReport] = useState<StockReport | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -28,12 +28,12 @@ export default function StockAnalysis() {
     cancelRef.current = null
   }, [])
 
-  // 搜索面板点击：进入采集阶段
+  // 搜索面板点击：先采集日线数据
   const handleSelect = useCallback(
     (stock: StockBrief) => {
       cancel()
-      setCollecting(stock)
-      setSelected(null)
+      setSelected(stock)
+      setCollecting(true)
       setReport(null)
       setError(null)
       setProgress(null)
@@ -41,13 +41,10 @@ export default function StockAnalysis() {
     [cancel]
   )
 
-  // 采集完成：进入报告生成阶段
+  // 日线采集完成后自动生成报告
   const handleCollectComplete = useCallback(
     (stock: StockBrief) => {
-      setCollecting(null)
-      setSelected(stock)
-      setReport(null)
-      setError(null)
+      setCollecting(false)
       setProgress({ stage: 'fetching_data', progress: 5, message: '连接后端...' })
       cancelRef.current = streamReport(stock.code, {
         onProgress: (ev) => setProgress(ev),
@@ -58,32 +55,31 @@ export default function StockAnalysis() {
         }
       })
     },
-    [cancel]
+    []
   )
 
   useEffect(() => cancel, [cancel])
 
-  const generating = selected !== null && report === null && error === null
+  const generating = selected !== null && !collecting && report === null && error === null
   const hasReportError = report !== null && !!report.error
   const pct = progress?.progress ?? 0
 
   return (
     <div style={{ height: '100%', overflow: 'auto', padding: '14px 18px' }}>
-      {/* 搜索面板：无采集、无报告时显示 */}
-      {collecting === null && selected === null && (
+      {/* 搜索面板：无报告时显示 */}
+      {selected === null && (
         <SearchPanel onSelect={handleSelect} />
       )}
 
-      {/* 采集阶段：显示 CollectCard */}
-      {collecting !== null && (
-        <div style={{ maxWidth: 560, margin: '80px auto' }}>
+      {/* 日线采集卡片 */}
+      {selected && collecting && (
+        <div style={{ maxWidth: 520, margin: '40px auto' }}>
           <div style={{ marginBottom: 10 }}>
-            <a onClick={() => { setCollecting(null) }} style={{ fontSize: 12 }}>
+            <a onClick={() => { setSelected(null); setCollecting(false) }} style={{ fontSize: 12 }}>
               ← 重新搜索
             </a>
           </div>
-          <h3 style={{ marginBottom: 8 }}>数据采集</h3>
-          <CollectCard stock={collecting} onComplete={handleCollectComplete} />
+          <CollectCard stock={selected} onComplete={handleCollectComplete} />
         </div>
       )}
 

@@ -2,6 +2,8 @@ fastapi>=0.115.0
 uvicorn>=0.30.0
 sqlalchemy>=2.0.0
 aiosqlite>=0.20.0
+# MySQL 异步驱动（backend/.env 配置 MYSQL_* 后启用；回退 SQLite 时用不到）
+aiomysql>=0.2.0
 greenlet>=3.0.0
 pydantic>=2.0.0
 pandas>=2.0.0

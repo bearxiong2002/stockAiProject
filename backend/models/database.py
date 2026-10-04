@@ -98,6 +98,29 @@ class KlineMinute(Base):
     amount: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class KlineDaily(Base):
+    """日线K线数据"""
+
+    __tablename__ = "kline_daily"
+    __table_args__ = (
+        UniqueConstraint("stock_code", "trade_date", name="uq_kline_daily"),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    stock_code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    trade_date: Mapped[str] = mapped_column(String(16), nullable=False)
+    open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pre_close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    change: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pct_chg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vol: Mapped[float | None] = mapped_column(Float, nullable=True)
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
@@ -107,9 +130,8 @@ def get_engine():
     if _engine is None:
         url = settings.database_url()
         if url.startswith("mysql"):
-            # pool_pre_ping + pool_recycle: MySQL wait_timeout 回收空闲连接后自愈
             _engine = create_async_engine(
-                url, echo=False, pool_pre_ping=True, pool_recycle=3600
+                url, echo=False, pool_recycle=3600
             )
         else:
             _engine = create_async_engine(url, echo=False)

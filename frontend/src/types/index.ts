@@ -450,3 +450,19 @@ export interface CollectCheckResult {
   min_time: string | null
   max_time: string | null
 }
+
+export interface CollectedStockItem {
+  stock_code: string
+  stock_name: string
+  freq: string
+  row_count: number
+  min_time: string | null
+  max_time: string | null
+}
+
+export interface CollectedStockListResponse {
+  items: CollectedStockItem[]
+  total: number
+  page: number
+  page_size: number
+}

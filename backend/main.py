@@ -50,8 +50,11 @@ class SPAStaticFiles(StaticFiles):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     settings.ensure_dirs()
     await init_db()
+    from services.kline_collector import set_main_loop
+    set_main_loop(asyncio.get_running_loop())
     from services.llm_config import load_llm_config
     await load_llm_config()
     logging.getLogger("stockpanel").info(

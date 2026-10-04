@@ -1,8 +1,8 @@
 """应用配置。
 
-配置优先级（高到低）: SQLite config 表 > 环境变量 > backend/.env > 默认值。
+配置优先级（高到低）: config 表（MySQL/SQLite）> 环境变量 > backend/.env > 默认值。
 阶段3 起股票数据源配置遵循 design.md §4.1.6: 环境变量 > .env > 默认值，
-不从 SQLite/配置接口接受密钥覆盖；密钥只在请求头使用，不回显、不入日志。
+不从 config 表/配置接口接受密钥覆盖；密钥只在请求头使用，不回显、不入日志。
 """
 from __future__ import annotations
 
@@ -43,7 +43,62 @@ APP_DATA_DIR = Path(
 DATA_DIR: Path = APP_DATA_DIR
 CACHE_DIR: Path = DATA_DIR / "cache"
 LOG_DIR: Path = DATA_DIR / "logs"
-DB_PATH: Path = DATA_DIR / "stockpanel.db"
+DB_PATH: Path = DATA_DIR / "stockpanel.db"  # SQLite 回退用（未配置 MySQL 时）
+
+# ---------------------------------------------------------------------------
+# MySQL 数据库（models/database.py 使用）
+# 在 backend/.env 填写连接信息；MYSQL_HOST 留空时回退本地 SQLite。
+# 密码含 @ / : 等特殊字符无需手动转义（mysql_url 内做 URL 编码）。
+# ---------------------------------------------------------------------------
+
+MYSQL_HOST: str = os.environ.get("MYSQL_HOST", "").strip()
+MYSQL_PORT: int = int(os.environ.get("MYSQL_PORT", "3306"))
+MYSQL_USER: str = os.environ.get("MYSQL_USER", "root").strip()
+MYSQL_PASSWORD: str = os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DATABASE: str = os.environ.get("MYSQL_DATABASE", "stockpanel").strip()
+MYSQL_CHARSET: str = os.environ.get("MYSQL_CHARSET", "utf8mb4").strip()
+
+# 完整连接串覆盖（高级用法，优先级最高），如:
+#   mysql+aiomysql://user:pass@host:3306/stockpanel?charset=utf8mb4
+STOCKPANEL_DB_URL: str = os.environ.get("STOCKPANEL_DB_URL", "").strip()
+
+
+def mysql_url(with_db: bool = True) -> str | None:
+    """构造 MySQL 连接串；未配置主机时返回 None。with_db=False 用于预建库。"""
+    if not MYSQL_HOST:
+        return None
+    from urllib.parse import quote, quote_plus
+
+    auth = quote_plus(MYSQL_USER or "root")
+    if MYSQL_PASSWORD:
+        auth += ":" + quote_plus(MYSQL_PASSWORD)
+    url = f"mysql+aiomysql://{auth}@{MYSQL_HOST}:{MYSQL_PORT}/"
+    if with_db:
+        url += quote(MYSQL_DATABASE, safe="")
+    return f"{url}?charset={quote_plus(MYSQL_CHARSET)}"
+
+
+def database_url() -> str:
+    """实际使用的数据库连接串: 显式 URL > MySQL > SQLite（回退）。"""
+    if STOCKPANEL_DB_URL:
+        return STOCKPANEL_DB_URL
+    mysql = mysql_url()
+    if mysql:
+        return mysql
+    return f"sqlite+aiosqlite:///{DB_PATH}"
+
+
+def is_mysql() -> bool:
+    return database_url().startswith("mysql")
+
+
+def db_description() -> str:
+    """日志用、脱敏的数据库描述（不含密码）。"""
+    if STOCKPANEL_DB_URL:
+        return "custom-db-url"
+    if MYSQL_HOST:
+        return f"mysql://{MYSQL_USER}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
+    return str(DB_PATH)
 
 # 缓存子目录（按 design.md 4.1.2）
 CACHE_SUBDIRS: dict[str, str] = {

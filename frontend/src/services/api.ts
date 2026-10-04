@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { CollectCheckResult, CollectStatus, StockBrief } from '@/types'
+import type { CollectCheckResult, CollectedStockListResponse, CollectStatus, StockBrief } from '@/types'
 
 const api = axios.create({
   baseURL: '/api',
@@ -102,6 +102,31 @@ import type {
 export async function getTechnical(code: string, days = 250): Promise<TechnicalResult> {
   const { data } = await api.get<TechnicalResult>(`/stock/${code}/technical`, {
     params: { days }
+  })
+  return data
+}
+
+export interface ChipItem {
+  price: number
+  percent: number
+}
+
+export interface ChipDistribution {
+  trade_date: string
+  items: ChipItem[]
+  perf: {
+    cost_5pct: number | null
+    cost_15pct: number | null
+    cost_85pct: number | null
+    cost_95pct: number | null
+    weight_avg: number | null
+    winner_rate: number | null
+  } | null
+}
+
+export async function getChipDistribution(code: string, tradeDate?: string): Promise<ChipDistribution> {
+  const { data } = await api.get<ChipDistribution>(`/stock/${code}/chips`, {
+    params: tradeDate ? { trade_date: tradeDate } : undefined
   })
   return data
 }
@@ -334,13 +359,13 @@ export async function getPortfolioAiAdvice(force = false): Promise<PortfolioAiAd
   return data
 }
 
-// ---------- 分钟K线数据采集 ----------
+// ---------- K线数据采集 ----------
 
 export async function startCollect(
   code: string,
   name: string,
-  years = 3,
-  freq = '5min'
+  years = 1,
+  freq = 'daily'
 ): Promise<CollectStatus> {
   const { data } = await api.post<CollectStatus>(
     `/collect/${code}/start`,
@@ -357,11 +382,43 @@ export async function getCollectStatus(code: string): Promise<CollectStatus> {
 
 export async function checkCollectData(
   code: string,
-  freq = '5min'
+  freq = 'daily'
 ): Promise<CollectCheckResult> {
   const { data } = await api.get<CollectCheckResult>(
     `/collect/${code}/check`,
     { params: { freq } }
+  )
+  return data
+}
+
+export async function getCollectedStocks(
+  page = 1,
+  pageSize = 12
+): Promise<CollectedStockListResponse> {
+  const { data } = await api.get<CollectedStockListResponse>(
+    '/collect/list',
+    { params: { page, page_size: pageSize } }
+  )
+  return data
+}
+
+export async function deleteCollectData(
+  code: string,
+  freq = 'daily'
+): Promise<{ ok: boolean; removed: number }> {
+  const { data } = await api.delete(`/collect/${code}`, { params: { freq } })
+  return data as { ok: boolean; removed: number }
+}
+
+export async function updateCollectData(
+  code: string,
+  name: string,
+  freq = 'daily'
+): Promise<CollectStatus> {
+  const { data } = await api.post<CollectStatus>(
+    `/collect/${code}/update`,
+    null,
+    { params: { name, freq } }
   )
   return data
 }

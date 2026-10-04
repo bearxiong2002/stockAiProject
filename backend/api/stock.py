@@ -107,7 +107,7 @@ def _list_impl() -> tuple[list[StockBrief], dict[str, str]]:
 
 
 @router.get("/{code}/kline", response_model=KlineResponse)
-def get_kline(
+async def get_kline(
     code: str,
     period: str = Query("daily", pattern="^(daily|weekly|monthly)$"),
     days: int = Query(250, ge=30, le=2500, description="默认返回最近 N 个交易日"),
@@ -116,13 +116,27 @@ def get_kline(
                                    description="显式区间开始（优先于 days）"),
     end_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ):
-    """K线数据 {items, data_meta}；显式区间优先，否则按 as_of 回溯 days。"""
+    """K线数据 {items, data_meta}；优先从本地 DB 读取，无数据时回退到 ProMax。"""
     resolved_start = start_date
     if resolved_start is None:
         base_day = datetime.fromisoformat(end_date or _iso_today_like())
         resolved_start = (base_day - timedelta(days=int(days * 1.55) + 15)).strftime("%Y-%m-%d")
-    df = _fetcher.get_kline(code, period=period, start_date=resolved_start,
-                            end_date=end_date, adjust=adjust)
+
+    from services.kline_collector import get_local_kline
+    local = await get_local_kline(code, period=period,
+                                  start_date=resolved_start, end_date=end_date)
+    if local is not None:
+        return KlineResponse(
+            items=local,
+            data_meta={"source": "local_db", "api": "kline_daily",
+                       "coverage": len(local)},
+        )
+
+    import asyncio
+    df = await asyncio.to_thread(
+        _fetcher.get_kline, code, period=period,
+        start_date=resolved_start, end_date=end_date, adjust=adjust,
+    )
     return KlineResponse(items=_records(df), data_meta=df.attrs.get("data_meta") or {})
 
 
@@ -191,6 +205,12 @@ def get_fundamental(code: str):
     result["data_meta"] = (valuation.get("_data_meta")
                            if isinstance(valuation, dict) else None) or {}
     return result
+
+
+@router.get("/{code}/chips")
+def get_chip_distribution(code: str, trade_date: str | None = None):
+    """筹码分布数据（cyq_chips + cyq_perf）。"""
+    return _fetcher.get_chip_distribution(code, trade_date)
 
 
 async def _save_report_history(report: dict) -> None:

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Empty, Spin, Tag, Typography } from 'antd'
 import StockSearch from '@/components/StockSearch'
+import CollectedGrid from './CollectedGrid'
 import { getRecentReports } from '@/services/api'
 import type { RecentReportItem } from '@/services/api'
 import type { StockBrief } from '@/types'
@@ -9,7 +10,7 @@ interface SearchPanelProps {
   onSelect: (stock: StockBrief) => void
 }
 
-/** 无报告时的居中大搜索面板 + 最近报告记录（report_history 全局最近）。 */
+/** 无报告时的居中大搜索面板 + 最近报告记录 + 已采集数据网格。 */
 export default function SearchPanel({ onSelect }: SearchPanelProps) {
   const [recent, setRecent] = useState<RecentReportItem[] | null>(null)
 
@@ -27,7 +28,7 @@ export default function SearchPanel({ onSelect }: SearchPanelProps) {
     <div
       style={{
         display: 'flex', flexDirection: 'column', alignItems: 'center',
-        justifyContent: 'flex-start', paddingTop: '14vh', gap: 28, height: '100%'
+        justifyContent: 'flex-start', paddingTop: '10vh', gap: 24, height: '100%'
       }}
     >
       <div style={{ textAlign: 'center' }}>
@@ -37,7 +38,10 @@ export default function SearchPanel({ onSelect }: SearchPanelProps) {
         </Typography.Text>
       </div>
       <StockSearch size="large" style={{ width: 480 }} onSelect={onSelect} />
-      <div style={{ width: 520, marginTop: 8 }}>
+
+      <CollectedGrid onSelect={onSelect} />
+
+      <div style={{ width: 520, marginTop: 4 }}>
         <div style={{ color: 'var(--text-secondary)', fontSize: 12, marginBottom: 8 }}>最近报告</div>
         {recent === null ? (
           <div style={{ textAlign: 'center' }}><Spin size="small" /></div>

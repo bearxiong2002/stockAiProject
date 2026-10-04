@@ -1,6 +1,6 @@
 """LLM 配置解析与密钥加密存储（design.md §4.4.4、§8.2）。
 
-优先级（逐字段，高到低）: SQLite config 表 > 环境变量/.env > 默认值。
+优先级（逐字段，高到低）: config 表（MySQL/SQLite）> 环境变量/.env > 默认值。
 股票数据源密钥不在此模块（仍由环境变量独占，见 §4.1.6），两者互不影响。
 
 密钥加密存储: 首次使用时在应用数据目录生成本机密钥文件 `secret.key`（0600），
@@ -191,7 +191,7 @@ def get_llm_config() -> dict:
 
 
 async def load_llm_config() -> dict:
-    """从 SQLite config 表加载（启动时调用；逐字段覆盖环境变量）。"""
+    """从 config 表加载（启动时调用；逐字段覆盖环境变量）。"""
     global _cache
     from models.database import ConfigItem, get_session_factory
 
@@ -209,20 +209,20 @@ async def load_llm_config() -> dict:
     provider = values.get(KEY_PROVIDER)
     if provider is not None:
         base["provider"] = _normalize_provider(provider)
-        sources["provider"] = "sqlite"
+        sources["provider"] = "db"
     if KEY_API_KEY in values:
         decrypted = _secret_box.decrypt(values[KEY_API_KEY])
         if decrypted is not None:
             base["api_key"] = decrypted
-            sources["api_key"] = "sqlite"
+            sources["api_key"] = "db"
     api_base = values.get(KEY_API_BASE)
     if api_base is not None and api_base.strip():
         base["api_base"] = api_base.strip()
-        sources["api_base"] = "sqlite"
+        sources["api_base"] = "db"
     model = values.get(KEY_MODEL)
     if model is not None and model.strip():
         base["model"] = model.strip()
-        sources["model"] = "sqlite"
+        sources["model"] = "db"
     base["sources"] = sources
     _cache = resolve_llm_config(base)
     logger.info("LLM 配置已加载: provider=%s available=%s",

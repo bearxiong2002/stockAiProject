@@ -17,7 +17,8 @@ import tempfile
 
 _TMP = tempfile.mkdtemp(prefix="stockpanel_p4_")
 os.environ["STOCK_DATA_MODE"] = "mock"          # 锁定 mock，导入前设置
-os.environ["STOCKPANEL_DATA_DIR"] = _TMP        # 隔离 DB 与缓存
+os.environ["STOCKPANEL_DATA_DIR"] = _TMP
+os.environ["MYSQL_HOST"] = ""                  # 锁定 SQLite 回退，不受 backend/.env 影响        # 隔离 DB 与缓存
 
 import asyncio
 import sys

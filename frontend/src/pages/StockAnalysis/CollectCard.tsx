@@ -16,11 +16,11 @@ interface CollectCardProps {
   onComplete: (stock: StockBrief) => void
 }
 
-/** 分钟K线采集卡片: 查库 → 自动采集 → 轮询进度 → 完成后点击生成报告。 */
+/** 日线采集卡片: 查库 → 自动采集 → 轮询进度 → 完成后自动生成报告。 */
 export default function CollectCard({
   stock,
   years = 3,
-  freq = '5min',
+  freq = 'daily',
   onComplete,
 }: CollectCardProps) {
   const [status, setStatus] = useState<CollectStatus | null>(null)

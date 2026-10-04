@@ -58,10 +58,9 @@ class ReportBuilder:
                                 "warnings": [], "coverage": {}}
         warnings: list[str] = []
         try:
-            # 默认回溯 420 自然日 ≈285 交易日，满足 MA250/251 价格点需求
             kline = self._fetcher.get_kline(ts, adjust="qfq")
             k_meta = kline.attrs.get("data_meta", {})
-        except Exception as exc:  # 核心数据失败 → 报告不可产出
+        except Exception as exc:
             yield {"stage": "report", "progress": 100,
                    "report": {"error": f"行情数据获取失败: {exc}",
                               "stock_info": {"code": code}}}
