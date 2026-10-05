@@ -135,7 +135,7 @@ STOCK_DATA_MODE: str = os.environ.get("STOCK_DATA_MODE", "mock").strip().lower()
 
 # 双端业务地址（可覆盖；能力目录从 ProMax 服务根地址构建）
 DATAHUBCO_BASE_URL: str = os.environ.get(
-    "DATAHUBCO_BASE_URL", "http://datahubco.com/app-api/openapi/v1/tushare"
+    "DATAHUBCO_BASE_URL", "https://datahubco.com/app-api/openapi/v1/tushare"
 ).rstrip("/")
 PROMAX_BASE_URL: str = os.environ.get(
     "PROMAX_BASE_URL", "https://pcd.mobcvb.cn/tushare/pro"
@@ -160,7 +160,8 @@ PROMAX_CAPABILITIES_URL: str = os.environ.get(
 DATAHUBCO_API_KEY: str = os.environ.get("DATAHUBCO_API_KEY", "")
 PROMAX_API_KEY: str = os.environ.get("PROMAX_API_KEY", "")
 
-# 基础版当前为明文 HTTP（手册 §2），必须显式允许才启用
+# 基础版已改为 HTTPS（http:// 会被 301 到 https，客户端不跟随重定向会拿到 HTML）；
+# 仅当手动把 DATAHUBCO_BASE_URL 配成 http:// 时才需要显式允许
 DATAHUBCO_ALLOW_HTTP: bool = os.environ.get(
     "DATAHUBCO_ALLOW_HTTP", "false"
 ).strip().lower() in ("1", "true", "yes")

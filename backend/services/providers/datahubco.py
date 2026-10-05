@@ -1,6 +1,6 @@
 """Datahubco 基础版数据源（design.md §4.1.3）。
 
-- 业务地址: http://datahubco.com/app-api/openapi/v1/tushare（手册 §2: 当前仅 HTTP）
+- 业务地址: https://datahubco.com/app-api/openapi/v1/tushare（http:// 现会 301 到 https）
 - 鉴权: X-API-Key 请求头（settings.DATAHUBCO_API_KEY，绝不入 URL/日志）
 - 规范接口名 stock_basic（手册名，已真实验收）；用户示例别名 stock-basic 已单独验证，
   记录在验收文档，不作为生产路径。
