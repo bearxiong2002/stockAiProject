@@ -320,7 +320,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ./scripts/make_windows_package.sh   # 生成 dist-windows/StockPanel-Windows.zip（含 backend/.env 密钥）
 ```
 
-把 zip 私下发过去，对方解压后双击 `install.bat`：自动用 winget 安装 Git / Python 3.12 / Node.js，
-克隆代码到 `%USERPROFILE%\StockPanel`，写入密钥，创建桌面快捷方式并启动（`http://localhost:18900`）。
+把 zip 私下发过去，对方解压后双击 `install.bat`：缺什么自动下载安装什么（Git 便携版 / Python 3.12 / Node.js 便携版，国内镜像优先，无需 winget 和管理员权限，需 64 位 Win10+），
+克隆代码到 `install.bat` 同级的 `StockPanel` 文件夹，写入密钥，创建桌面快捷方式并启动（`http://localhost:18900`）。
 之后只需双击桌面图标（`scripts/windows/start.bat`），每次启动会自动 `git pull`，
 依赖或代码有变化时才重装依赖/重建前端。zip 含密钥，切勿公开分发。

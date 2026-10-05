@@ -1,24 +1,52 @@
 ﻿# StockPanel Windows 一键安装
 #
 # 由 install.bat 调用。与 stockpanel.env（密钥文件，scripts/make_windows_package.sh 打包）放在同一目录。
-# 流程: 安装 Git/Python/Node（winget）→ 克隆代码到 %USERPROFILE%\StockPanel → 写入 backend\.env
+# 流程: 缺什么装什么（Git/Python/Node，直接下载，国内镜像优先，无需 winget、无需管理员）
+#       → 克隆代码到 install.bat 同级的 StockPanel 文件夹 → 写入 backend\.env
 #       → 创建桌面快捷方式 → 调用仓库内 start.ps1（装依赖、构建前端、启动并打开浏览器）。
 # 可重复运行: 已安装的部分会跳过，已有代码会更新。
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'   # PS 5.1 的下载进度条会让下载慢几十倍
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $RepoUrl = 'https://github.com/bearxiong2002/stockAiProject.git'
-$Repo = Join-Path $env:USERPROFILE 'StockPanel'
+# 代码放在安装包同级目录，方便找到；安装后这个文件夹不能删
+$Repo = Join-Path $PSScriptRoot 'StockPanel'
 $EnvSource = Join-Path $PSScriptRoot 'stockpanel.env'
+$Tools = Join-Path $env:LOCALAPPDATA 'StockPanel-tools'   # Git / Node 便携版安装位置
+
+# 下载地址按顺序尝试: 国内镜像 → 官方
+$PythonUrls = @(
+    'https://registry.npmmirror.com/-/binary/python/3.12.10/python-3.12.10-amd64.exe',
+    'https://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe',
+    'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe')
+$NodeUrls = @(
+    'https://registry.npmmirror.com/-/binary/node/v20.19.5/node-v20.19.5-win-x64.zip',
+    'https://nodejs.org/dist/v20.19.5/node-v20.19.5-win-x64.zip')
+$NodeExeRel = 'node-v20.19.5-win-x64\node.exe'
+$GitUrls = @(
+    'https://registry.npmmirror.com/-/binary/git-for-windows/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip',
+    'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip')
+$GitExeRel = 'cmd\git.exe'
 
 function Say($msg) { Write-Host "`n>>> $msg" -ForegroundColor Cyan }
 function Fail($msg) { Write-Host "`n[错误] $msg" -ForegroundColor Red; exit 1 }
 
 function Update-PathEnv {
-    # winget 装完的程序写在注册表 PATH 里，当前窗口需要重新读取
+    # 新装的程序写在注册表 PATH 里，当前窗口需要重新读取
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = "$machine;$user"
+}
+
+function Add-UserPath($dir) {
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $user) { $user = '' }
+    if (($user -split ';') -notcontains $dir) {
+        [Environment]::SetEnvironmentVariable('Path', "$dir;$user".TrimEnd(';'), 'User')
+    }
+    Update-PathEnv
 }
 
 function Test-Python {
@@ -34,12 +62,45 @@ function Test-Python {
     return $false
 }
 
-function Install-WithWinget($id, $name, [string[]]$extra = @()) {
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Fail "这台电脑没有 winget，无法自动安装 $name。请手动安装后重新运行本脚本:`n  Git:    https://git-scm.com/download/win`n  Python: https://www.python.org/downloads/ （安装时勾选 Add python.exe to PATH）`n  Node:   https://nodejs.org/ （选 LTS 版本）"
+function Get-Download($urls, $fileName) {
+    $dest = Join-Path $env:TEMP $fileName
+    foreach ($u in $urls) {
+        Write-Host "下载 $fileName ..."
+        try {
+            Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing
+            return $dest
+        } catch {
+            Write-Host "  这个地址下载失败，换下一个: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
-    Say "正在安装 $name（如弹出“是否允许更改”请点“是”）..."
-    & winget install -e --id $id --source winget --accept-package-agreements --accept-source-agreements --silent @extra
+    Fail "$fileName 下载失败，请检查网络后重新运行。"
+}
+
+function Install-PortableZip($urls, $name, $exeRel) {
+    $target = Join-Path $Tools $name
+    $zip = Get-Download $urls "$name.zip"
+    Say "解压 $name（需要一两分钟）..."
+    if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    # 系统自带 tar（Win10 1803+）解压快得多；没有就用 Expand-Archive
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (Test-Path $tar) { & $tar -xf $zip -C $target }
+    if (-not (Test-Path $tar) -or $LASTEXITCODE -ne 0) {
+        Expand-Archive -Path $zip -DestinationPath $target -Force
+    }
+    Remove-Item $zip -Force
+    $exe = Join-Path $target $exeRel
+    if (-not (Test-Path $exe)) { Fail "$name 解压后没有找到 $exeRel" }
+    Add-UserPath (Split-Path $exe -Parent)
+}
+
+function Install-Python {
+    $exe = Get-Download $PythonUrls 'python-3.12.10-amd64.exe'
+    Say '安装 Python（静默安装，需要一两分钟）...'
+    $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList `
+        '/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=0', 'Include_test=0'
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Fail "Python 安装失败（退出码 $($p.ExitCode)）。" }
     Update-PathEnv
 }
 
@@ -47,6 +108,12 @@ Write-Host '========================================' -ForegroundColor Green
 Write-Host '   StockPanel 股票分析 - 一键安装' -ForegroundColor Green
 Write-Host '========================================' -ForegroundColor Green
 
+if ([Environment]::OSVersion.Version.Major -lt 10 -or $PSVersionTable.PSVersion.Major -lt 5) {
+    Fail '需要 Windows 10 或更高版本（Win7/Win8 无法运行新版 Python 和 Node.js）。'
+}
+if (-not [Environment]::Is64BitOperatingSystem) {
+    Fail '需要 64 位 Windows。'
+}
 if (-not (Test-Path $EnvSource) -and -not (Test-Path "$Repo\backend\.env")) {
     Fail "没找到密钥文件 stockpanel.env。请把整个安装包解压后再运行，不要直接在压缩包里双击。"
 }
@@ -56,14 +123,13 @@ Update-PathEnv
 # ---- 1. 基础软件 ----
 Say '检查基础软件（Git / Python / Node.js）...'
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Install-WithWinget 'Git.Git' 'Git'
+    Install-PortableZip $GitUrls 'git' $GitExeRel
 }
 if (-not (Test-Python)) {
-    Install-WithWinget 'Python.Python.3.12' 'Python 3.12' @(
-        '--override', '/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1')
+    Install-Python
 }
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Install-WithWinget 'OpenJS.NodeJS.LTS' 'Node.js'
+    Install-PortableZip $NodeUrls 'node' $NodeExeRel
 }
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail 'Git 安装失败，请重启电脑后再运行一次。' }

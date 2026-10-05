@@ -114,5 +114,10 @@ app.include_router(market_api.router)
 
 # 生产模式: 托管前端构建产物（必须在所有 API 路由之后挂载）
 if settings.SERVE_STATIC and (settings.FRONTEND_DIST / "index.html").is_file():
+    # Windows 上 mimetypes 读注册表，.js 常被登记为 text/plain，
+    # 浏览器会拒绝执行 module 脚本导致白屏/黑屏，这里强制覆盖
+    import mimetypes
+    mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("text/css", ".css")
     app.mount("/", SPAStaticFiles(directory=settings.FRONTEND_DIST, html=True),
               name="frontend")
